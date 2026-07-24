@@ -3,7 +3,11 @@
 *.sqlite3
 /data/
 /logs/
-/reports/
+/reports/*
+!/reports/DIAGNOSIS.md
+!/reports/diag_data/
+/reports/diag_data/*
+!/reports/diag_data/*.csv
 __pycache__/
 *.pyc
 .pytest_cache/
