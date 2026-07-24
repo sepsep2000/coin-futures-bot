@@ -51,6 +51,7 @@ meanrev:
   rsi_period: 14
   rsi_oversold: 30
   rsi_overbought: 70
+  atr_period: 14        # SPEC 2.3 스탑 계산용 ATR 기간
   stop_atr_mult: 1.2
   entry_order_type: "limit_next_open"   # 다음 봉 시가 지정가(maker 우선)
   limit_cancel_after_bars: 2
