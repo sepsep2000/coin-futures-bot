@@ -1,0 +1,14 @@
+,0
+n_trades_valid,914.0
+n_winners,572.0
+n_losers,342.0
+winners_mean_mfe_r,2.6508368073512694
+winners_median_capture_ratio,0.5981208555111024
+winners_mean_giveback_r,1.1305977427018978
+losers_mean_mfe_r,0.6895098109635369
+losers_median_mfe_r,0.5927605897784174
+losers_mean_mae_r,1.344629462294706
+frac_losers_reached_mfe_ge_1R,0.24561403508771928
+frac_losers_reached_mfe_ge_0.5R,0.5935672514619883
+corr_realized_r_vs_mfe_r,0.8644669549534734
+mean_stop_dist_price,32.832615884312304

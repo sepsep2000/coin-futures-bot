@@ -1,0 +1,11 @@
+,0
+n_funding_records,3902.0
+extreme_pctile_used,5.0
+hi_threshold_funding_rate,0.00019506899999999997
+lo_threshold_funding_rate,-3.65925e-05
+n_trades_total,914.0
+n_trades_overlap_extreme_funding,76.0
+avg_funding_usd_overlap,0.211394527572234
+avg_funding_usd_non_overlap,0.03017508557524334
+avg_r_multiple_overlap,0.8634663517342868
+avg_r_multiple_non_overlap,0.5507576189631728

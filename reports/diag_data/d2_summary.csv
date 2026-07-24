@@ -1,0 +1,14 @@
+,0
+n_simulations,1000
+n_entries_matched,630
+n_long_matched,326
+real_pf,1.0995969900071472
+real_avg_r,0.5767596580119744
+real_sharpe,7.114355794510876
+null_pf_median,0.7746941947021933
+null_avg_r_median,0.3889534453689587
+null_sharpe_median,-17.035398540993363
+real_pf_percentile,100.0
+real_avg_r_percentile,100.0
+real_sharpe_percentile,100.0
+verdict_pass_95pct,True

@@ -1,0 +1,5 @@
+,0
+n_horizons,8
+max_abs_t_stat,2.3134632074370316
+horizon_with_max_t,192
+all_horizons_below_t2,False

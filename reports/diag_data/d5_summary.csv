@@ -1,0 +1,8 @@
+,0
+n_trades,914.0
+mean_r_multiple,0.5767596580119744
+std_r_multiple,1.505830451304314
+cohens_d,0.3830176614587646
+achieved_power_at_n,1.0
+required_n_power_80,54.0
+required_n_power_90,72.0

@@ -1,0 +1,11 @@
+,0
+n_trades,914.0
+n_excluded_for_R_cost,1.0
+avg_cost_bps_of_notional,10.633432454779435
+median_cost_bps_of_notional,10.090394274290642
+avg_cost_in_R,0.09699823824762989
+median_cost_in_R,0.09398064699421256
+gross_pf,1.2865724409121881
+net_pf,1.0995969900071472
+pf_erosion,0.18697545090504097
+breakeven_cost_multiplier,1.6125500607919991
