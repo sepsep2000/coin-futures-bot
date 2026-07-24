@@ -1,0 +1,23 @@
+{
+  "_comment": "각 phase 섹션은 해당 Phase가 실제로 시작될 때 채운다. 없는 섹션은 자동 스킵됨.",
+
+  "_phase2_example": {
+    "backtest_cmd": ["python", "src/backtest/engine.py", "--symbol", "BTC", "--from", "2023-01-01"],
+    "signal_fn_module": "src.strategy.donchian",
+    "ohlcv_columns_used": ["open", "high", "low", "close"],
+    "allowed_columns": ["open", "high", "low", "close", "volume"]
+  },
+
+  "_phase3_example": {
+    "results_path": "results/walkforward.json",
+    "max_degradation_pct": 0.40,
+    "min_windows": 5
+  },
+
+  "_phase4_example": {
+    "log_path": "logs/trades.jsonl",
+    "error_log_path": "logs/errors.jsonl",
+    "account_equity_usd": 1000,
+    "backtest_expected_winrate": 0.45
+  }
+}
