@@ -15,7 +15,11 @@ active_strategies: ["trend"]
 
 exchange:
   id: binanceusdm
-  pairs: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+  # 2026-07-24 (Phase 3 자산 구성 재검토, SPEC 4절 옵션 3): BTC/SOL이 MaxDD·
+  # 몬테카를로만 악화시키고 PF에는 도움이 안 됨을 워크포워드로 실증
+  # (3페어 합산 G3 MaxDD95%ile 37.7% vs ETH 단독 19.3%, PASS). ETH 단독으로
+  # 축소. BTC/SOL 과거 데이터는 삭제하지 않고 보존(향후 재검토용).
+  pairs: ["ETH/USDT:USDT"]
   timeframe_trend: "15m"
   timeframe_regime: "1h"
 
