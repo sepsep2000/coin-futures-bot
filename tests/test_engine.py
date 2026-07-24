@@ -197,3 +197,47 @@ def test_meanrev_position_holds_when_nothing_triggers():
     new_pos, trades, pnl = _manage_meanrev_position(position, bar, "RANGE", MEANREV_CFG, COST_CFG)
     assert new_pos is not None
     assert trades == []
+
+
+# --- 스탑 그레이스 피리어드 (2026-07-24 재설계, 옵션 1) ---
+
+GRACE_CFG = {**TREND_CFG, "stop_grace_period_bars": 4}
+
+
+def test_grace_period_suppresses_stop_within_window():
+    position = _long_position()  # entry=100, stop=98
+    bar = _bar("2024-01-01 00:15", 99, 99.5, 97.0, 98.5)  # low(97) <= stop(98) -> 평소면 즉시 스탑
+    new_pos, trades, pnl = _manage_trend_position(position, bar, pd.Series({"chandelier_stop": None}), GRACE_CFG, COST_CFG)
+    assert new_pos is not None  # bars_held=1 <= grace(4) -> 스탑 체크 자체를 건너뜀
+    assert trades == []
+    assert new_pos.bars_held == 1
+
+
+def test_grace_period_stop_still_applies_after_window_expires():
+    position = _long_position()
+    position.bars_held = 4  # 다음 호출에서 5가 됨 -> grace(4) 초과
+    bar = _bar("2024-01-01 01:15", 99, 99.5, 97.0, 98.5)
+    new_pos, trades, pnl = _manage_trend_position(position, bar, pd.Series({"chandelier_stop": None}), GRACE_CFG, COST_CFG)
+    assert new_pos is None
+    assert trades[0].exit_reason == "stop_loss"
+
+
+def test_grace_period_default_zero_behaves_like_before():
+    """stop_grace_period_bars가 config에 없으면(기존 테스트/설정) 그레이스 없이
+    즉시 스탑 체크 — 회귀 방지."""
+    position = _long_position()
+    bar = _bar("2024-01-01 00:15", 99, 99.5, 97.0, 98.5)
+    new_pos, trades, pnl = _manage_trend_position(position, bar, pd.Series({"chandelier_stop": None}), TREND_CFG, COST_CFG)
+    assert new_pos is None
+    assert trades[0].exit_reason == "stop_loss"
+
+
+def test_grace_period_does_not_suppress_partial_tp():
+    """그레이스 피리어드는 스탑에만 적용 — 그레이스 기간 중에도 1.5R 도달 시
+    부분청산은 정상 동작해야 한다."""
+    position = _long_position()  # entry=100, stop=98, stop_distance=2 -> 1.5R=103
+    bar = _bar("2024-01-01 00:15", 100, 103.5, 99.5, 103.0)  # 스탑 안 닿음, 1.5R 터치
+    new_pos, trades, pnl = _manage_trend_position(position, bar, pd.Series({"chandelier_stop": None}), GRACE_CFG, COST_CFG)
+    assert new_pos is not None
+    assert new_pos.partial_taken is True
+    assert trades[0].exit_reason == "partial_tp"

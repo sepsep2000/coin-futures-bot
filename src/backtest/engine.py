@@ -136,12 +136,18 @@ def _close_position(
 def _manage_trend_position(
     position: Position, bar: pd.Series, trend_row: pd.Series, cfg: dict, cost_cfg: dict,
 ) -> tuple[Optional[Position], list[Trade], float]:
-    """트렌드 포지션 1봉 관리. 반환: (갱신된 포지션 또는 None(전량청산), 청산 트레이드 목록, 실현손익 합)."""
+    """트렌드 포지션 1봉 관리. 반환: (갱신된 포지션 또는 None(전량청산), 청산 트레이드 목록, 실현손익 합).
+
+    ★ stop_grace_period_bars(2026-07-24 재설계, 옵션 1): 진입 후 이 봉수 동안은
+    스탑 체크 자체를 건너뛴다. ETH 단독 트레이드 로그 분석 결과 stop_loss 청산의
+    68.1%가 중앙값 18봉(4.5h) 뒤에 발생하고 4봉 이내 즉시 스탑은 13.5%뿐이라,
+    이 값(4봉=1h, 그리드 아님·고정)은 그 최하위 구간만 겨냥한다."""
     trades: list[Trade] = []
     realized = 0.0
     position.bars_held += 1
 
-    if _stop_hit(position, bar):
+    grace_period = cfg.get("stop_grace_period_bars", 0)
+    if position.bars_held > grace_period and _stop_hit(position, bar):
         trade, pnl = _close_position(position, bar.name, position.current_stop, "stop_loss", 1.0, cost_cfg)
         return None, [trade], pnl
 

@@ -26,7 +26,7 @@ CFG = {
     },
     "trend": {
         "donchian_period": 20, "ema_period": 50, "atr_period": 14, "atr_median_window": 96,
-        "low_vol_filter": True, "stop_atr_mult": 2.0, "require_confirmation_bar": True,
+        "low_vol_filter": True, "stop_atr_mult": 2.0, "require_confirmation_bar": True, "stop_grace_period_bars": 4,
         "partial_tp_r_multiple": 1.5, "partial_tp_pct": 25, "breakeven_after_partial": True,
         "chandelier_period": 22, "chandelier_atr_mult": 3.0, "time_exit_bars": 96, "time_exit_min_r": 1.0,
     },
