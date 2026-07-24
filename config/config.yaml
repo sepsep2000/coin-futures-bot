@@ -92,11 +92,12 @@ data:
 walkforward:
   train_months: 6
   test_months: 2
+  # 2026-07-24: meanrev 기각으로 trend 그리드만 남김(3×3=9조합). require_confirmation_bar는
+  # 이미 결정된 설계라 그리드에 넣지 않는다 — 학습구간에서도 고정 True로 검증한다
+  # (켜고 끄고를 이번 구간 성과로 고르면 과최적화, SPEC 4절).
   grid:
     donchian_period: [15, 20, 25]
     trend_stop_atr_mult: [1.5, 2.0, 2.5]
-    meanrev_bb_std: [1.8, 2.0, 2.2]
-    rsi_threshold: [25, 30, 35]
 
 gates:
   g2_min_oos_trades: 300
