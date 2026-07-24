@@ -1,6 +1,17 @@
 # config.yaml — RSIB 전략 파라미터 (SPEC.md 단일 진실 소스, 코드 하드코딩 금지)
+#
+# 변경 이력(2026-07-24, Phase 2 G1 결과 기반 재설계 — PROGRESS.md/BACKTEST_BASELINE.md 참조):
+# - meanrev 전략 기각(SPEC 4절: PF 0.85, 평균 R 0.054, BTC만 PF 0.67 — 파라미터
+#   튜닝이 아니라 전략 자체 문제로 판단). active_strategies에서 제외, 코드는
+#   보존(src/strategy/meanrev.py, 테스트 그대로 유지 — 향후 다른 진입조건으로
+#   재설계할 수 있음).
+# - trend에 require_confirmation_bar 추가(휩쏘 대응, 후보 A). 이 값은 전체구간
+#   재백테스트로 확정하지 않고 Phase 3 워크포워드 학습구간에서만 검증한다.
 
 mode: testnet   # CLAUDE.md 규칙 5 — 코드에서 절대 기본값을 live로 두지 않는다. live는 사용자가 직접 바꾼다.
+
+# 2026-07-24: meanrev 기각(SPEC 4절) — trend 단일 전략으로 축소.
+active_strategies: ["trend"]
 
 exchange:
   id: binanceusdm
@@ -9,6 +20,11 @@ exchange:
   timeframe_regime: "1h"
 
 account:
+  # ⚠️ SPEC.md에 계좌 규모(초기 자본) 수치가 명시돼 있지 않다 — 플레이스홀더.
+  # 게이트 판정(PF/Sharpe/MaxDD%)은 비율 기반이라 이 값 자체엔 영향받지 않지만
+  # (risk_per_trade_pct 기반 사이징이라 손익 % 곡선은 자본 규모에 불변), equity
+  # 곡선의 달러 표시·펀딩비 절대액 계산엔 쓰인다. 실제 값 확인 필요 (PROGRESS.md 참조).
+  initial_equity_usd: 10000
   leverage: 2
   margin_mode: isolated
   risk_per_trade_pct: 0.5
@@ -44,7 +60,13 @@ trend:
   chandelier_atr_mult: 3.0
   time_exit_bars: 96           # 24h (15m 봉 기준)
   time_exit_min_r: 1.0
+  # 후보 A(2026-07-24 재설계): 돌파 봉 즉시 진입 -> 중앙값 보유 11봉짜리 휩쏘가
+  # 68.3%(BACKTEST_BASELINE.md). 돌파 다음 1봉이 같은 채널 레벨 위/아래에서
+  # 마감할 때만 진입하도록 확인봉 1개 추가. Phase 3 워크포워드에서 검증 예정.
+  require_confirmation_bar: true
 
+# 2026-07-24 SPEC 4절 기각(PF 0.85, 평균R 0.054, BTC만 PF 0.67) — active_strategies에서
+# 제외됨. 코드/테스트/파라미터는 향후 재설계 참고용으로 보존만 한다.
 meanrev:
   bb_period: 20
   bb_std: 2.0

@@ -19,6 +19,13 @@ def generate_trend_signals(df_15m: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     진입(Long): 종가 > Donchian(20) 상단 + 종가 > EMA(50) + ATR(14) >= 최근 96봉
     ATR 중위값(저변동 휩쏘 필터). 진입(Short): 대칭(종가 < 하단, 종가 < EMA).
     초기 스탑: 진입가 ∓ stop_atr_mult × ATR(14).
+
+    ★ `require_confirmation_bar`(2026-07-24 재설계, Phase 2 G1 결과 반영): 돌파
+    봉 즉시 진입은 중앙값 보유 11봉짜리 휩쏘가 68%였다(BACKTEST_BASELINE.md 참조).
+    True면 돌파 봉(raw 조건 성립) 다음 1봉이 "그 돌파 봉이 만든 채널 상단/하단"
+    위/아래에서 마감할 때만 실제 진입한다 — 확인봉에서 EMA/저변동 필터를 다시
+    검사하지는 않는다(돌파 봉에서 이미 검증됨). 이 값 자체를 이번 전체구간
+    성과로 튜닝하지 않는다 — Phase 3 워크포워드 학습구간에서만 검증한다.
     """
     high, low, close = df_15m["high"], df_15m["low"], df_15m["close"]
 
@@ -36,8 +43,15 @@ def generate_trend_signals(df_15m: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     # 지표 웜업 구간(NaN)에서는 절대 진입하지 않는다(근사치로 채우지 않음, CLAUDE.md 규칙 4).
     warmup = don_upper.isna() | don_lower.isna() | ema_line.isna() | atr14.isna() | atr_median.isna()
 
-    entry_long = (close > don_upper) & (close > ema_line) & low_vol_ok & ~warmup
-    entry_short = (close < don_lower) & (close < ema_line) & low_vol_ok & ~warmup
+    raw_long = (close > don_upper) & (close > ema_line) & low_vol_ok & ~warmup
+    raw_short = (close < don_lower) & (close < ema_line) & low_vol_ok & ~warmup
+
+    if cfg.get("require_confirmation_bar", False):
+        entry_long = raw_long.shift(1).fillna(False) & (close > don_upper.shift(1))
+        entry_short = raw_short.shift(1).fillna(False) & (close < don_lower.shift(1))
+    else:
+        entry_long = raw_long
+        entry_short = raw_short
 
     return pd.DataFrame({
         "entry_long": entry_long.fillna(False),

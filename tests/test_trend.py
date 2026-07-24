@@ -121,3 +121,52 @@ def test_trailing_stop_matches_chandelier_formula():
 ])
 def test_time_exit_triggered_boundaries(bars_held, r_multiple, expected):
     assert time_exit_triggered(bars_held, r_multiple, CFG) is expected
+
+
+# --- 후보 A: 진입 확인봉 (2026-07-24 재설계, SPEC 4절 — 휩쏘 대응) ---
+
+CONFIRM_CFG = {**CFG, "require_confirmation_bar": True}
+
+
+def _breakout_then_bar(direction: str, next_close: float) -> pd.DataFrame:
+    """돌파봉 뒤에 확인봉 1개를 추가한 픽스처. next_close가 돌파봉이 만든
+    채널 레벨 위/아래를 유지하는지에 따라 확인 성공/실패를 나눈다."""
+    base = _breakout_df(direction)
+    extra_close = next_close
+    extra_high, extra_low = extra_close + 0.1, extra_close - 0.1
+    extra = pd.DataFrame({"open": [extra_close], "high": [extra_high], "low": [extra_low], "close": [extra_close]})
+    return pd.concat([base, extra], ignore_index=True)
+
+
+def test_confirmation_bar_disabled_enters_on_breakout_bar_itself():
+    """require_confirmation_bar=False(기본값)면 기존 동작 그대로 — 돌파봉 즉시 진입."""
+    df = _breakout_df("long")
+    sig = generate_trend_signals(df, CFG)
+    assert bool(sig["entry_long"].iloc[-1]) is True
+
+
+def test_confirmation_bar_enabled_does_not_enter_on_breakout_bar():
+    df = _breakout_df("long")
+    sig = generate_trend_signals(df, CONFIRM_CFG)
+    assert not sig["entry_long"].any()  # 확인봉이 아직 없어 진입 자체가 없음
+
+
+def test_confirmation_bar_enters_when_next_bar_holds_above_level():
+    df = _breakout_then_bar("long", next_close=111.0)  # 돌파봉 채널 상단(~100.3) 위 유지
+    sig = generate_trend_signals(df, CONFIRM_CFG)
+    assert bool(sig["entry_long"].iloc[-1]) is True   # 확인봉에서 진입
+    assert bool(sig["entry_long"].iloc[-2]) is False  # 돌파봉 자체는 진입 안 함
+
+
+def test_confirmation_bar_rejects_when_next_bar_reverses_below_level():
+    df = _breakout_then_bar("long", next_close=100.2)  # 돌파봉 채널 상단(~100.3) 아래로 복귀
+    sig = generate_trend_signals(df, CONFIRM_CFG)
+    assert not sig["entry_long"].any()  # 확인 실패 -> 휩쏘로 판단, 진입 없음
+
+
+def test_confirmation_bar_short_symmetric():
+    df = _breakout_df("short")
+    sig_disabled = generate_trend_signals(df, CFG)
+    sig_confirm = generate_trend_signals(df, CONFIRM_CFG)
+    assert bool(sig_disabled["entry_short"].iloc[-1]) is True
+    assert not sig_confirm["entry_short"].any()  # 확인봉 없음
