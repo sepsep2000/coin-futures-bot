@@ -1,0 +1,8 @@
+ccxt
+pandas
+numpy
+pyyaml
+python-telegram-bot
+pytest
+pyarrow
+python-dotenv
