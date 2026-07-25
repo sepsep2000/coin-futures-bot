@@ -2,28 +2,51 @@
 
 ## 0. 실행 경로에 대한 판단 (사전 확인 필요했던 사항)
 
-`scripts/gate_verify.py`를 열어보니 `checks/phase2_backtest.py`,
+> **[2026-07-25 정정]** 아래 굵게 표시된 원래 서술("세 파일이 저장소에
+> 존재하지 않는다", "ImportError로 즉시 죽는다")은 **사실이 아니었다** —
+> 정정 사유와 정확한 사실관계는 이 박스 바로 아래에 정리한다. 원문은
+> 무엇을 잘못 판단했는지 보여주는 기록으로서 취소선만 긋고 남겨둔다
+> (문서에서 지우지 않음 — 정정 이력 보존).
+
+~~`scripts/gate_verify.py`를 열어보니 `checks/phase2_backtest.py`,
 `checks/phase3_walkforward.py`, `checks/phase4_live.py`를 import하도록
 돼 있는데 **이 세 파일이 저장소에 존재하지 않는다** — 지금 그대로 실행하면
-`ImportError`로 즉시 죽는다. 이 부분을 사용자에게 확인했고("너가 알아서
-하고 결과에 내용 포함해줘 판단할게") 판단 근거를 여기 남긴다.
+`ImportError`로 즉시 죽는다.~~ ← **오류였다.** 원인: 프로젝트 루트의
+`checks/`(내가 신호검증 하네스용으로 직접 만든 `checks/signal_validation.py`가
+있는 곳)만 `find`로 확인하고, `gate_verify.py`가 실제로 참조하는
+`scripts/checks/`(별도 하위 경로)는 확인하지 않았다. `scripts/gate_verify.py`가
+`sys.path.insert(0, os.path.dirname(__file__))`로 `scripts/`를 경로 맨
+앞에 넣기 때문에 `from checks import ...`는 `scripts/checks/`를 먼저
+찾는다 — 이 구조를 놓쳤다.
 
-**실제로 SPEC.md 4절 G1/G2/G3가 지금까지 실행돼온 경로는 `scripts/gate_verify.py`가
-아니다** — `src/backtest/walkforward.py`의 `evaluate_g2()`/`evaluate_g3()`/
-`monte_carlo_max_drawdowns()`를 `scripts/run_walkforward.py`로 실행해
-WALKFORWARD_REPORT.md/FINAL_REPORT.md를 만들어온 것이 실제 이력이다.
-`scripts/gate_verify.py` + `checks/phase*.py`는 이것과 별개로 예전에
-언급된 "헤드리스 자가수정 루프 하네스"(harness/ 모듈, selfcorrect 스킬
-관련) 스캐폴딩으로 보이며 실제 체크 로직이 구현된 적이 없다.
+**정정된 사실관계** (2026-07-25 재확인, 코드 재실행으로 검증):
+- `scripts/checks/__init__.py`, `phase2_backtest.py`, `phase3_walkforward.py`,
+  `phase4_live.py` **전부 실제로 존재한다.**
+- `python scripts/gate_verify.py`를 재실행하면 `ImportError` 없이
+  정상 종료한다(`{"status": "PASS", "ran_phases": [], "failures": []}`).
+  `ran_phases`가 빈 배열인 이유는 크래시가 아니라, `gate_verify.py`
+  자체의 설계상 `harness_config.json`에 있는 phase 섹션만 실행하는데
+  이 저장소엔 `harness_config.json`이 없기 때문(`harness_config.example.json`만
+  있음) — "아직 설정 안 된 phase는 스킵"이 정상 동작이다(파일 docstring에도
+  명시돼 있음).
+- `scripts/checks/phase2_backtest.py`/`phase3_walkforward.py`는 재현성
+  검증(같은 입력 2회 실행 결과 비교)·IS/OOS 성과열화 체크처럼 **일반적인
+  회귀/이상탐지 목적의 별도 하네스**다. 코드를 확인해보니 SPEC.md 4절이
+  정의하는 구체적 게이트 기준(OOS 거래≥300건, Sharpe≥1.0 AND Calmar≥1.0,
+  MaxDD≤15% 등)을 검증하도록 만들어진 게 아니라, `harness_config.json`에
+  체크 대상(백테스트 커맨드, 결과 파일 경로 등)을 채워 넣어야 동작하는
+  범용 스캐폴딩이다 — 이 프로젝트에선 그 설정이 채워진 적이 없다.
 
-**선택**: 이번 G1/G2/G3는 `src/backtest/walkforward.py`의 기존 함수를
-그대로 재사용해 실행했다(`scripts/diag/official_gate_check.py`). `checks/
-phase2_backtest.py` 등을 새로 만들어 `gate_verify.py`를 고치는 방향은
-택하지 않았다 — 실제 검증 로직이 하나도 없는 상태에서 전부 새로 구현해야
-해서 "정식 하네스 재실행"이 아니라 "신규 검증 프레임워크 개발"이 되고,
-이번 태스크의 다른 절대금지 사항(신규 엔진 개발 관련 제약)과도 결이
-맞지 않다고 판단했다. **이 판단이 틀렸다면(사용자가 진짜로 gate_verify.py
-경로를 원했다면) 알려주면 그쪽으로 다시 하겠다.**
+**정정 후에도 STEP 1~4의 실제 판단(경로 선택 자체)은 바뀌지 않는다** —
+다만 근거가 달라진다. 원래 서술은 "gate_verify.py가 고장나서 못 씀"이었지만,
+정확한 이유는 "gate_verify.py + scripts/checks/phase*.py는 SPEC.md의
+구체적 G1/G2/G3 수치 기준을 검증하도록 설계되지 않은, 성격이 다른 범용
+하네스라 이번 목적에 맞지 않았다"이다. `src/backtest/walkforward.py`의
+`evaluate_g2()`/`evaluate_g3()`/`monte_carlo_max_drawdowns()`를
+`scripts/diag/official_gate_check.py`로 재실행한 선택 자체, 그리고 아래
+STEP 1~4의 모든 수치·판정은 이 정정과 무관하게 그대로 유효하다(재확인
+결과 수치 변경 없음 — 애초에 이 정정은 "어느 경로를 썼는가"에 대한
+서술 오류이지 실행 결과에 대한 오류가 아니었다).
 
 ---
 
