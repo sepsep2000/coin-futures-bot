@@ -14,15 +14,16 @@ LIVE_EXECUTION_ARCHITECTURE.md(설계) + `src/live/`·`src/notify/`·
 | 2 | ~~주문 실행(제출/폴링/취소) + 재시도~~ | `src/live/executor.py` | **[2026-07-25 완료]** testnet 실측 검증(주문ID/체결가 확인) |
 | 3 | ~~`ensure_stop_placed` (최우선 복구 로직)~~ | `src/live/executor.py` | **[2026-07-25 완료]** 실측 중 발견한 버그(fetch_open_orders가 STOP_MARKET을 못 봄) 수정 완료 |
 | 4 | ~~텔레그램 발신(기본 send_message + 특화 함수들)~~ | `src/notify/telegram.py` | **[2026-07-25 완료]** 실제 수신 확인 |
-| 5 | ~~스케줄러 메인 루프 + 두 전략 틱 처리~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** 아래 "11" 항목의 스코프 축소 전제로 완료 — 완전한 백테스트-라이브 동등성은 아님 |
+| 5 | ~~스케줄러 메인 루프 + 두 전략 틱 처리~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** 최초엔 "11" 항목의 스코프 축소 전제로 완료됐으나, 같은 날 "11"도 마저 완료돼 지금은 완전한 백테스트-라이브 동등성 확보 |
 | 6 | `/pause` `/resume` `/close_all` 명령 처리 + 인증 | `src/notify/telegram.py` | 설계 문서 6절 미결(인증 방식) 먼저 결정 |
 | 7 | `healthcheck.py` 5개 체크 실제 구현 | `scripts/healthcheck.py` | 1~4가 끝나야 각 체크 대상이 실존(이제 전제 충족, 착수 가능) |
 | 8 | 각 모듈 테스트 작성(정상/경계/실패 1건씩, CLAUDE.md 작업사이클) | `tests/test_live_*.py` | 구현과 함께 진행, 사후 추가 금지 |
 | 9 | 부분체결 재주문 정책 확정 + 구현 | `src/live/executor.py` | 설계 문서 6절 미결 사항. `handle_partial_fill()` 여전히 골격만 |
 | 10 | ~~2a 리밸런스 실행 순서(청산/신규 우선순위) 확정 + 구현~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** reports/REBALANCE_ORDER_ANALYSIS.md 실측 계산, 청산 먼저 채택 |
-| **11** | **filtered_trend 라이브 부분익절/트레일링스탑/시간청산 구현** | `src/live/state.py`, `src/live/scheduler.py` | **[신규, 2026-07-25 발견]** 현재 라이브는 스탑로스 청산만 구현(과거 실측상 청산의 68.1%를 차지하는 다수 경로는 커버됨) — `_manage_trend_position`의 나머지 세 경로(부분익절/트레일링/시간청산)는 `positions` 테이블에 `initial_stop`/`bars_held`/`partial_taken`/`funding_paid_usd` 컬럼이 없어 재사용 불가. 스키마 확장 선행 필요. **G4(페이퍼 트레이딩) 착수 전 필수** — 이 간극이 남아있으면 라이브 동작이 백테스트가 검증한 것과 정확히 같지 않다. |
-| **12** | **ETH 심볼 충돌 근본 해결** | 설계 재검토 | **[신규, 2026-07-25 발견]** 2a 유니버스(20자산)에 ETH 포함 — filtered_trend과 격리마진 넷팅 충돌 위험. 임시완화책(2a 라이브에서 ETH 제외)만 적용됨(reports/REBALANCE_ORDER_ANALYSIS.md 4절). 헤지모드 전환 또는 심볼별 넷포지션 통합 회계 등 근본 해결은 미착수. |
+| 11 | ~~filtered_trend 라이브 부분익절/트레일링스탑/시간청산 구현~~ | `src/live/state.py`, `src/live/scheduler.py` | **[2026-07-25 완료]** positions 스키마 확장(initial_stop/entry_fee_usd/funding_paid_usd/partial_taken) + engine.py::_manage_trend_position()/_apply_funding() 그대로 재사용. 커버리지 재확인: reports/EXIT_LOGIC_COVERAGE.md(실측 exit_reason 분포 stop_loss 65.2%/partial_tp 33.5%/time_stop 1.3%, 전부 라이브 반영) |
+| 12 | ~~ETH 심볼 충돌 완화 검증~~ | 설계 재검토 | **[2026-07-25 완료]** 2a 라이브 유니버스에서 ETH 제외가 시장중립성(상관계수/BTC 잔여베타)에 주는 영향을 실측 재계산, 미미함을 확인해 정식 채택으로 전환(reports/2A_ETH_EXCLUSION_IMPACT.md). **단, 심볼 충돌의 근본 해결(헤지모드 전환 등)은 여전히 미착수** — ETH 제외는 여전히 완화책이지 구조적 해결이 아님. 부가로 2a 표준편차가 19자산 기준 14.8% 증가하는 걸 발견 — 아래 "14" 참조. |
 | **13** | **연속 오류 킬스위치(`consecutive_error_kill_switch_triggered`) 스케줄러 통합** | `src/live/scheduler.py` | **[신규, 2026-07-25 발견]** `src/risk.py`에 함수는 이미 있으나(연속 5회 API 오류 시 전 포지션 청산+봇 정지) 스케줄러 루프에 아직 연결 안 됨 — 이번 태스크는 일일 손실한도 킬스위치만 명시적으로 요청받아 그것만 구현. |
+| **14** | **vol-parity 가중치 재검증(2a 19자산 기준)** | `config.yaml` | **[신규, 2026-07-25 발견]** 현재 배분(filtered_trend 83.83% : 2a 16.17%)은 2a **20자산** 백테스트 변동성으로 산출됐다. 라이브 2a(ETH 제외, 19자산)는 주간수익률 표준편차가 14.8% 더 크다(reports/2A_ETH_EXCLUSION_IMPACT.md) — 엄밀한 vol-parity 원칙대로면 2a 비중이 현재값보다 약간 낮아야 한다. 배분 재탐색 금지 원칙(config.yaml 자체 주석)에 따라 재계산은 별도 진단 리포트 작업으로 분리, 이번 발견은 기록만 함. |
 
 ## 2. 사용자가 직접 해야 하는 작업 (코드로 대신할 수 없음)
 

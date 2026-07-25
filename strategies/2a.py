@@ -128,8 +128,12 @@ def run(cfg: dict, project_root: Path) -> pd.DataFrame:
 # filtered_trend이 거래하는 바로 그 심볼이다 — Binance USDM 원웨이 모드에서는
 # 심볼당 격리마진 포지션이 하나뿐이라 두 전략이 동시에 ETH를 들면 거래소
 # 레벨에서 넷팅되어 각 전략의 포지션 추적이 깨진다(reports/
-# REBALANCE_ORDER_ANALYSIS.md 4절 실측). 근본 해결(헤지모드 전환 등)은 이번
-# 범위 밖 — 임시 완화책으로 **라이브 경로에서만** ETH를 유니버스에서 제외한다.
+# REBALANCE_ORDER_ANALYSIS.md 4절 실측). 심볼 충돌 자체의 근본 해결(헤지모드
+# 전환 등)은 이번 범위 밖 — 라이브 경로에서만 ETH를 유니버스에서 제외한다.
+# 2026-07-25: 이 제외가 2a의 시장중립성(상관계수/BTC 잔여베타)에 주는 영향을
+# 실측 재계산해 미미함을 확인, 정식 채택으로 전환했다(reports/
+# 2A_ETH_EXCLUSION_IMPACT.md — 주간수익률 표준편차가 14.8% 증가하는 부수효과는
+# 발견됐으나 vol-parity 가중치 재조정은 별도 후속 과제로 분리).
 # ★ 백테스트 run()은 건드리지 않는다(20자산 그대로) — 게이트 통과 수치는
 # 이 상수와 무관하다, run_live_step()에서만 참조.
 LIVE_EXCLUDED_SYMBOLS = {"ETH"}

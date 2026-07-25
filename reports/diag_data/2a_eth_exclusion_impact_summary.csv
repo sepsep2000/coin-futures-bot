@@ -1,0 +1,17 @@
+,0
+n_weeks_20,185.0
+n_weeks_19,185.0
+corr_vs_filtered_trend_20asset,-0.09739271160389795
+corr_vs_filtered_trend_19asset_eth_excluded,-0.08592164526750246
+n_weeks_compared_corr_20,185.0
+n_weeks_compared_corr_19,185.0
+residual_beta_vs_btc_20asset,0.06255827312961575
+residual_beta_vs_btc_19asset_eth_excluded,0.09782383413555787
+r_squared_vs_btc_20asset,-0.03150596673370454
+r_squared_vs_btc_19asset_eth_excluded,-0.015699106820456832
+n_weeks_compared_beta_20,185.0
+n_weeks_compared_beta_19,185.0
+mean_weekly_gross_return_20asset,0.01398771389927756
+mean_weekly_gross_return_19asset,0.013030246981399981
+std_weekly_gross_return_20asset,0.07228046086909953
+std_weekly_gross_return_19asset,0.08298822750464228
