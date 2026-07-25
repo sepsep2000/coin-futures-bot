@@ -40,11 +40,40 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+_POSITIONS_MIGRATED_COLUMNS = {
+    # 2026-07-25 추가: filtered_trend 라이브 청산을 스탑로스만이 아니라
+    # 부분익절/트레일링/시간청산까지 engine.py의 _manage_trend_position()을
+    # 그대로 재사용해 처리하려면 Position 데이터클래스가 요구하는 필드가
+    # 전부 있어야 한다(reports/EXIT_LOGIC_COVERAGE.md). bars_held는 컬럼으로
+    # 안 두고 entry_time에서 매 틱 계산한다(상태 이중관리 방지, 재시작에도
+    # 안전) — 나머지 넷은 계산으로 복원 불가능해 반드시 저장해야 한다.
+    "initial_stop": "REAL",
+    "entry_fee_usd": "REAL NOT NULL DEFAULT 0.0",
+    "funding_paid_usd": "REAL NOT NULL DEFAULT 0.0",
+    "partial_taken": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _migrate_positions_schema(conn: sqlite3.Connection) -> None:
+    """이미 존재하는 positions 테이블에 신규 컬럼을 추가한다(값이 있는 기존
+    행은 DEFAULT로 채워짐 — filtered_trend 쪽은 이후 첫 재진입부터 정확한
+    값이 채워지고, 마이그레이션 시점에 이미 열려있던 포지션의 initial_stop은
+    NULL로 남는다 — 이런 포지션은 부분익절/트레일링 판단이 불가능하므로
+    ensure_stop_placed의 최소 안전망(current_stop)만 계속 적용되고,
+    scheduler.py가 재확인 후 청산하는 걸 권장(운영 절차, 코드가 자동으로
+    강제하지 않음 — 이번 태스크 범위 밖)."""
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
+    for col, decl in _POSITIONS_MIGRATED_COLUMNS.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+
+
 def init_db(db_path: Path) -> None:
     """SQLite 파일 생성 + 4개 테이블(positions/orders/equity_snapshots/
     rebalance_log) 스키마 적용. 이미 존재하면 `CREATE TABLE IF NOT EXISTS`라
-    아무 일도 안 함(멱등) — 스키마 버전 마이그레이션(컬럼 추가 등)은 아직
-    다루지 않는다(TODO: 버전 관리 방식 결정 필요, 다음 세션)."""
+    아무 일도 안 함(멱등). 컬럼 추가형 마이그레이션은
+    `_migrate_positions_schema()`가 담당(TODO: 컬럼 삭제/타입변경처럼
+    ALTER TABLE로 못 하는 마이그레이션은 여전히 다루지 않음, 다음 세션)."""
     with closing(_connect(db_path)) as conn:
         conn.execute(
             """
@@ -60,6 +89,7 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        _migrate_positions_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS orders (
@@ -107,20 +137,31 @@ def init_db(db_path: Path) -> None:
 
 
 def save_position(db_path: Path, symbol: str, strategy: str, direction: str, qty: float,
-                   entry_price: float, entry_time: str, current_stop: Optional[float]) -> None:
+                   entry_price: float, entry_time: str, current_stop: Optional[float],
+                   initial_stop: Optional[float] = None, entry_fee_usd: float = 0.0,
+                   funding_paid_usd: float = 0.0, partial_taken: bool = False) -> None:
     """포지션 upsert. strategy='filtered_trend'|'2a', (symbol, strategy) 복합키라
     같은 symbol이 두 전략에 동시에(예: ETH가 filtered_trend 포지션이면서
-    동시에 2a 바스켓에도 포함) 존재할 수 있다 — 의도된 동작."""
+    동시에 2a 바스켓에도 포함) 존재할 수 있다 — 의도된 동작.
+
+    ★ initial_stop/entry_fee_usd/funding_paid_usd/partial_taken은 2026-07-25
+    추가(EXIT_LOGIC_COVERAGE.md) — filtered_trend 전용, engine.py의
+    Position 데이터클래스를 라이브에서 재구성하는 데 필요. 2a는 이 필드들을
+    안 쓴다(기본값 그대로 저장, 2a 포지션 행에서는 의미 없음)."""
     with closing(_connect(db_path)) as conn:
         conn.execute(
             """
-            INSERT INTO positions (symbol, strategy, direction, qty, entry_price, entry_time, current_stop)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (symbol, strategy, direction, qty, entry_price, entry_time, current_stop,
+                                    initial_stop, entry_fee_usd, funding_paid_usd, partial_taken)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, strategy) DO UPDATE SET
                 direction=excluded.direction, qty=excluded.qty, entry_price=excluded.entry_price,
-                entry_time=excluded.entry_time, current_stop=excluded.current_stop
+                entry_time=excluded.entry_time, current_stop=excluded.current_stop,
+                initial_stop=excluded.initial_stop, entry_fee_usd=excluded.entry_fee_usd,
+                funding_paid_usd=excluded.funding_paid_usd, partial_taken=excluded.partial_taken
             """,
-            (symbol, strategy, direction, qty, entry_price, entry_time, current_stop),
+            (symbol, strategy, direction, qty, entry_price, entry_time, current_stop,
+             initial_stop, entry_fee_usd, funding_paid_usd, int(partial_taken)),
         )
         conn.commit()
 

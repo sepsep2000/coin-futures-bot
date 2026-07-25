@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,69 @@ def test_save_and_load_position_roundtrip(db_path):
     assert positions[0]["symbol"] == "ETH/USDT:USDT"
     assert positions[0]["qty"] == 1.5
     assert positions[0]["current_stop"] == 2900.0
+
+
+def test_save_position_with_exit_logic_fields_roundtrip(db_path):
+    """2026-07-25 추가 필드(initial_stop/entry_fee_usd/funding_paid_usd/
+    partial_taken) - filtered_trend의 부분익절/트레일링 재구성에 필요."""
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.5, 3000.0, "2026-07-25T00:00:00Z", 2850.0,
+                   initial_stop=2850.0, entry_fee_usd=2.25, funding_paid_usd=0.0, partial_taken=False)
+    positions = load_open_positions(db_path, strategy="filtered_trend")
+    assert positions[0]["initial_stop"] == 2850.0
+    assert positions[0]["entry_fee_usd"] == 2.25
+    assert positions[0]["funding_paid_usd"] == 0.0
+    assert positions[0]["partial_taken"] == 0
+
+    # 부분익절 후 갱신(같은 (symbol, strategy) 재저장 -> upsert)
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.125, 3000.0, "2026-07-25T00:00:00Z", 3000.0,
+                   initial_stop=2850.0, entry_fee_usd=2.25, funding_paid_usd=0.15, partial_taken=True)
+    positions = load_open_positions(db_path, strategy="filtered_trend")
+    assert len(positions) == 1
+    assert positions[0]["qty"] == 1.125
+    assert positions[0]["partial_taken"] == 1
+    assert positions[0]["funding_paid_usd"] == 0.15
+
+
+def test_save_position_without_exit_logic_fields_uses_defaults(db_path):
+    """기존 호출부(파라미터 생략)와 하위호환 - 2a처럼 이 필드들을 안 쓰는
+    호출도 깨지지 않아야 한다."""
+    save_position(db_path, "BTC/USDT:USDT", "2a", "long", 0.01, 60000.0, "2026-07-25T00:00:00Z", 42000.0)
+    positions = load_open_positions(db_path, strategy="2a")
+    assert positions[0]["initial_stop"] is None
+    assert positions[0]["entry_fee_usd"] == 0.0
+    assert positions[0]["funding_paid_usd"] == 0.0
+    assert positions[0]["partial_taken"] == 0
+
+
+def test_init_db_migrates_existing_positions_table_missing_new_columns(tmp_path):
+    """마이그레이션 경계 케이스: 신규 컬럼 없이 만들어진 구버전 positions
+    테이블에 init_db()를 다시 돌리면 컬럼이 추가되고, 기존 행은 깨지지
+    않아야 한다(값은 DEFAULT로 채워짐)."""
+    db_path = tmp_path / "legacy_state.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE positions (
+                symbol TEXT NOT NULL, strategy TEXT NOT NULL, direction TEXT NOT NULL,
+                qty REAL NOT NULL, entry_price REAL NOT NULL, entry_time TEXT NOT NULL,
+                current_stop REAL, PRIMARY KEY (symbol, strategy)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "2026-07-24T00:00:00Z", 2900.0),
+        )
+        conn.commit()
+
+    init_db(db_path)  # 마이그레이션 실행
+
+    positions = load_open_positions(db_path, strategy="filtered_trend")
+    assert len(positions) == 1
+    assert positions[0]["qty"] == 1.0  # 기존 행 보존
+    assert positions[0]["initial_stop"] is None  # 신규 컬럼은 DEFAULT(NULL)
+    assert positions[0]["entry_fee_usd"] == 0.0
+    assert positions[0]["partial_taken"] == 0
 
 
 def test_recover_state_matches_when_db_and_exchange_agree(db_path):
