@@ -8,10 +8,14 @@ from src.live.state import (
     delete_position,
     init_db,
     load_equity_snapshots_since,
+    load_g4_start_timestamp,
+    load_metadata,
     load_open_positions,
     load_pending_orders,
     recover_state,
     save_equity_snapshot,
+    save_g4_start_timestamp,
+    save_metadata,
     save_order,
     save_position,
     save_rebalance_log,
@@ -213,3 +217,26 @@ def test_load_equity_snapshots_since_filters_and_orders_ascending(db_path):
 def test_load_equity_snapshots_since_empty_when_none_match(db_path):
     save_equity_snapshot(db_path, "2026-07-19T00:00:00Z", 900.0, 800.0, 100.0)
     assert load_equity_snapshots_since(db_path, "2026-07-20T00:00:00Z") == []
+
+
+# --- metadata / G4 시작 시각 (2026-07-25 추가) ---
+
+def test_save_and_load_metadata_roundtrip(db_path):
+    save_metadata(db_path, "some_key", "some_value")
+    assert load_metadata(db_path, "some_key") == "some_value"
+
+
+def test_load_metadata_missing_key_returns_none(db_path):
+    assert load_metadata(db_path, "never_set") is None
+
+
+def test_save_metadata_upserts_existing_key(db_path):
+    save_metadata(db_path, "k", "v1")
+    save_metadata(db_path, "k", "v2")
+    assert load_metadata(db_path, "k") == "v2"
+
+
+def test_save_and_load_g4_start_timestamp_roundtrip(db_path):
+    assert load_g4_start_timestamp(db_path) is None
+    save_g4_start_timestamp(db_path, "2026-07-25T00:00:00+00:00")
+    assert load_g4_start_timestamp(db_path) == "2026-07-25T00:00:00+00:00"

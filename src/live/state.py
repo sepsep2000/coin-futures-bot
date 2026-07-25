@@ -131,9 +131,57 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         conn.commit()
+
+
+def save_metadata(db_path: Path, key: str, value: str) -> None:
+    """범용 key-value 저장소 — 2026-07-25 추가, 첫 용도는 G4 시작 시각
+    기록(scripts/healthcheck.py). 매번 새 테이블을 만드는 대신 이후에도
+    비슷한 단일값 메타데이터가 생기면 재사용한다."""
+    with closing(_connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+
+
+def load_metadata(db_path: Path, key: str) -> Optional[str]:
+    with closing(_connect(db_path)) as conn:
+        row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+G4_START_TIMESTAMP_KEY = "g4_start_timestamp"
+
+
+def save_g4_start_timestamp(db_path: Path, ts: str) -> None:
+    """G4(페이퍼 트레이딩) 착수 시각 기록. 이 testnet 계좌는 이전 봇("코인봇
+    1세대")이 쓰던 계좌라 계좌 레벨 조회에 그 봇의 과거 활동이 섞여있을 수
+    있다 — 향후 거래 이력(fetch_my_trades 등 과거 데이터) 조회 기능을
+    추가할 때는 반드시 이 시각 이후로 필터링해야 한다.
+
+    ★ 2026-07-25 확인: recover_state()가 쓰는 exchange.fetch_positions()/
+    fetch_open_orders()는 "현재" 상태만 반환하는 함수라(청산된 포지션·
+    체결/취소된 과거 주문은 애초에 안 나옴) 이 필터링이 필요 없다 — 이전
+    봇이 남긴 미청산 포지션/미체결 주문이 있다면 그건 실제로 지금 계좌에
+    존재하는 이상 상태라 오히려 플래그돼야 맞다. 이 함수는 이후 과거이력
+    조회 기능(예: 30건 페이퍼 트레이딩 판정 리뷰)을 위한 기준점 제공용."""
+    save_metadata(db_path, G4_START_TIMESTAMP_KEY, ts)
+
+
+def load_g4_start_timestamp(db_path: Path) -> Optional[str]:
+    return load_metadata(db_path, G4_START_TIMESTAMP_KEY)
 
 
 def save_position(db_path: Path, symbol: str, strategy: str, direction: str, qty: float,

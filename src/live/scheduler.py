@@ -57,6 +57,7 @@ engine.py의 `_manage_trend_position()`/`_apply_funding()`을 그대로
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,7 @@ from strategies.filtered_trend import MOMENTUM_LOOKBACK_DAYS, SYMBOL as FT_SYMBO
 CATASTROPHIC_STOP_PCT = 0.30  # 2a 백스톱 — 전략 파라미터 아님, 운영 안전망(모듈 docstring 참조)
 DATA_LOOKBACK_DAYS_15M = 30  # ATR/EMA/BB/chandelier 지표 워밍업에 충분한 여유(가장 긴 lookback: bb_width_percentile_window=120h=5일)
 CONSECUTIVE_ERROR_THRESHOLD = 5  # SPEC.md 2.4 "연속 5회 API 오류" 그대로(src/risk.py 기본값과 일치) — 임의 정의 아님
+HEARTBEAT_PATH = Path(__file__).resolve().parent.parent.parent / "logs" / "heartbeat.json"  # scripts/healthcheck.py가 같은 경로를 읽음
 
 
 def _log_stderr(message: str) -> None:
@@ -136,9 +138,23 @@ def run_live_loop(cfg: dict, db_path: Path, max_iterations: Optional[int] = None
             if consecutive_error_kill_switch_triggered(consecutive_errors, CONSECUTIVE_ERROR_THRESHOLD):
                 _execute_kill_switch_liquidation(db_path, exec_exchange, consecutive_errors)
                 return
+        _write_heartbeat(HEARTBEAT_PATH, pd.Timestamp.now(tz="UTC"))
         iteration += 1
         if max_iterations is None or iteration < max_iterations:
             _sleep_until_next_tick(ts)
+
+
+def _write_heartbeat(path: Path, ts: pd.Timestamp) -> None:
+    """scripts/healthcheck.py가 읽는 생존 신호. ★ 배치 위치가 중요하다 —
+    이 호출은 try/except 블록 "다음"에만 오므로, `_tick()`이 예외 없이
+    멈춰버리는 행(hang) 상태에서는 이 줄에 도달하지 못해 하트비트가
+    갱신되지 않는다(의도된 동작 — 행 감지가 이 안전망의 존재 이유다).
+    `_tick()`이 예외를 던지고 빠르게 끝나는 경우는(루프 자체는 살아있음,
+    이미 별도 CRITICAL로 알림됨) 갱신된다 — "루프가 죽었다/멈췄다"와
+    "루프는 살아서 매 틱 실패를 보고하고 있다"를 구분하기 위함."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"last_tick_iso": ts.isoformat()}, f)
 
 
 def _execute_kill_switch_liquidation(db_path: Path, exec_exchange, consecutive_errors: int) -> None:

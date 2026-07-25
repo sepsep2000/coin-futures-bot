@@ -34,6 +34,15 @@ def db_path(tmp_path) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def _isolate_heartbeat_path(monkeypatch, tmp_path):
+    """★ 격리 안전장치 — run_live_loop()을 실행하는 테스트가 실수로 실제
+    프로젝트의 logs/heartbeat.json에 쓰지 않도록 전 테스트에 자동 적용.
+    개별 테스트가 하트비트 경로를 직접 검증해야 하면 그 안에서 다시
+    monkeypatch.setattr로 덮어쓰면 된다(나중 설정이 우선)."""
+    monkeypatch.setattr(scheduler, "HEARTBEAT_PATH", tmp_path / "_autouse_heartbeat.json")
+
+
 class _StubBalanceExchange:
     def __init__(self, balance_usdt: float = 10000.0):
         self.balance_usdt = balance_usdt
@@ -596,3 +605,45 @@ def test_execute_kill_switch_liquidation_reports_failed_closes_without_deleting_
     assert len(remaining) == 1  # 청산 실패 - state 유지(방치와는 다름, 명시적으로 남겨서 사람이 보게 함)
     assert len(sent) == 1
     assert "ETH/USDT:USDT" in sent[0]  # 실패 목록에 포함돼 CRITICAL로 보고됨
+
+
+# =====================================================================
+# 하트비트 (2026-07-25 추가 — scripts/healthcheck.py가 읽는 생존 신호)
+# =====================================================================
+
+def test_write_heartbeat_creates_file_with_iso_timestamp(tmp_path):
+    import json as _json
+
+    path = tmp_path / "sub" / "heartbeat.json"
+    ts = pd.Timestamp("2026-07-25 03:15:00", tz="UTC")
+
+    scheduler._write_heartbeat(path, ts)
+
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    assert data["last_tick_iso"] == ts.isoformat()
+
+
+def test_run_live_loop_writes_heartbeat_after_success_and_after_failure(db_path, monkeypatch, tmp_path):
+    """★ 성공/실패 둘 다 하트비트를 갱신해야 한다(루프 자체가 살아있다는
+    증거) — 갱신이 안 되는 경우는 오직 _tick()이 행(hang)돼 이 지점에
+    도달하지 못할 때뿐이어야 한다."""
+    heartbeat_path = tmp_path / "heartbeat.json"
+    monkeypatch.setattr(scheduler, "HEARTBEAT_PATH", heartbeat_path)
+    monkeypatch.setattr(scheduler, "get_exchange", lambda testnet=False: object())
+    monkeypatch.setattr(scheduler.executor, "get_authenticated_exchange", lambda testnet=True: _StubReconciledExchange())
+    monkeypatch.setattr(scheduler.live_state, "recover_state",
+                         lambda db, ex: SimpleNamespace(positions_match=True, orders_match=True, mismatches=[]))
+    monkeypatch.setattr(scheduler, "_sleep_until_next_tick", lambda ts: None)
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: True)
+
+    monkeypatch.setattr(scheduler, "_tick", lambda cfg, db, dex, eex, ts: None)  # 성공 케이스
+    scheduler.run_live_loop({"mode": "testnet"}, db_path, max_iterations=1)
+    assert heartbeat_path.exists()
+
+    def _boom(cfg, db, dex, eex, ts):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(scheduler, "_tick", _boom)  # 실패 케이스(킬스위치 임계치 미만)
+    heartbeat_path.unlink()
+    scheduler.run_live_loop({"mode": "testnet"}, db_path, max_iterations=1)
+    assert heartbeat_path.exists()  # 실패해도 갱신됨(루프는 살아있으므로)
