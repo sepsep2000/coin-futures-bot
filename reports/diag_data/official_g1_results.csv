@@ -1,0 +1,5 @@
+check,n_full_safe_trades,n_truncated_safe_trades,n_mismatched_entries,passed,n_records_checked,note,n_trades_real,n_trades_fee0,pf_real,pf_fee0,total_pnl_real,total_pnl_fee0,n_weeks,pf_gross,pf_net,mean_weekly_return_gross_pct,mean_weekly_return_net_pct
+filtered_trend_lookahead_truncation,632.0,632.0,0.0,True,,,,,,,,,,,,,
+2a_lookahead_asof_backward,,,,True,177.0,lookback_ret.asof(reb_date)는 reb_date 이전 데이터만 반환(pandas.Series.asof 명세) - 구조적으로 미래 데이터 접근 불가,,,,,,,,,,,
+filtered_trend_fee0_vs_real,,,,,,,638.0,642.0,1.3952879812021872,1.7540397483643904,5398.880542144961,10942.10286642062,,,,,
+2a_fee0(gross)_vs_real(net),,,,,,,,,,,,,185.0,1.7011713171164704,1.5648005427772622,1.4000731567883922,1.1807730994910948
