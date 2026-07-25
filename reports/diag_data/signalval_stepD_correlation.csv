@@ -1,0 +1,3 @@
+candidate,n_weeks_compared,weekly_return_correlation,is_independent
+3a,186,-0.027099960109136532,True
+3b,185,-0.10220866192170258,True

@@ -1,0 +1,3 @@
+candidate,n_events_raw,n_independent_clusters,cluster_size_mean,cluster_size_max,pct_events_in_clusters_ge2
+3a,2459,313,7.856230031948882,32,100.0
+3b,410,241,1.7012448132780082,8,63.65853658536585
