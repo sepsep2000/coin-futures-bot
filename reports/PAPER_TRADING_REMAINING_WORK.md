@@ -22,8 +22,8 @@ LIVE_EXECUTION_ARCHITECTURE.md(설계) + `src/live/`·`src/notify/`·
 | 10 | ~~2a 리밸런스 실행 순서(청산/신규 우선순위) 확정 + 구현~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** reports/REBALANCE_ORDER_ANALYSIS.md 실측 계산, 청산 먼저 채택 |
 | 11 | ~~filtered_trend 라이브 부분익절/트레일링스탑/시간청산 구현~~ | `src/live/state.py`, `src/live/scheduler.py` | **[2026-07-25 완료]** positions 스키마 확장(initial_stop/entry_fee_usd/funding_paid_usd/partial_taken) + engine.py::_manage_trend_position()/_apply_funding() 그대로 재사용. 커버리지 재확인: reports/EXIT_LOGIC_COVERAGE.md(실측 exit_reason 분포 stop_loss 65.2%/partial_tp 33.5%/time_stop 1.3%, 전부 라이브 반영) |
 | 12 | ~~ETH 심볼 충돌 완화 검증~~ | 설계 재검토 | **[2026-07-25 완료]** 2a 라이브 유니버스에서 ETH 제외가 시장중립성(상관계수/BTC 잔여베타)에 주는 영향을 실측 재계산, 미미함을 확인해 정식 채택으로 전환(reports/2A_ETH_EXCLUSION_IMPACT.md). **단, 심볼 충돌의 근본 해결(헤지모드 전환 등)은 여전히 미착수** — ETH 제외는 여전히 완화책이지 구조적 해결이 아님. 부가로 2a 표준편차가 19자산 기준 14.8% 증가하는 걸 발견 — 아래 "14" 참조. |
-| **13** | **연속 오류 킬스위치(`consecutive_error_kill_switch_triggered`) 스케줄러 통합** | `src/live/scheduler.py` | **[신규, 2026-07-25 발견]** `src/risk.py`에 함수는 이미 있으나(연속 5회 API 오류 시 전 포지션 청산+봇 정지) 스케줄러 루프에 아직 연결 안 됨 — 이번 태스크는 일일 손실한도 킬스위치만 명시적으로 요청받아 그것만 구현. |
-| **14** | **vol-parity 가중치 재검증(2a 19자산 기준)** | `config.yaml` | **[신규, 2026-07-25 발견]** 현재 배분(filtered_trend 83.83% : 2a 16.17%)은 2a **20자산** 백테스트 변동성으로 산출됐다. 라이브 2a(ETH 제외, 19자산)는 주간수익률 표준편차가 14.8% 더 크다(reports/2A_ETH_EXCLUSION_IMPACT.md) — 엄밀한 vol-parity 원칙대로면 2a 비중이 현재값보다 약간 낮아야 한다. 배분 재탐색 금지 원칙(config.yaml 자체 주석)에 따라 재계산은 별도 진단 리포트 작업으로 분리, 이번 발견은 기록만 함. |
+| 13 | ~~연속 오류 킬스위치(`consecutive_error_kill_switch_triggered`) 스케줄러 통합~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** N=5는 SPEC.md 2.4 문구 그대로(임의 정의 아님) — 연속 5회 틱 실패(개별 주문 실패는 executor.py가 이미 자체 처리해 예외를 안 던지므로 미포함) 시 양쪽 전략 전 포지션 청산 후 프로세스 정지(신규진입만 막는 일일손실한도와 다름). 청산 자체가 실패해도 state 미갱신(공허한 성공 금지) |
+| 14 | ~~vol-parity 가중치 재검증(2a 19자산 기준)~~ | `config.yaml` | **[2026-07-25 완료]** 같은 vol-parity 공식으로 2a 19자산(ETH 제외) 변동성 재적용 — filtered_trend 83.83%→85.63%, 2a 16.17%→14.37%로 갱신. 새 가중치에서도 G2/G3 PASS(Sharpe 1.843/Calmar 3.446/MaxDD 6.58%/MC MaxDD95% 10.55%, 15%/20% 임계치에 근접 안 함) — 상세: reports/VOL_PARITY_19ASSET_RECALC.md |
 
 ## 2. 사용자가 직접 해야 하는 작업 (코드로 대신할 수 없음)
 
