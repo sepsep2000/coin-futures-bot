@@ -122,7 +122,12 @@ portfolio:
 
 gates:
   g2_min_oos_trades: 300
+  # 2026-07-25: PF 단일 기준 대체(GATE_STRUCTURE_PROPOSAL_FINAL.md 승인,
+  # SPEC.md 4절 각주2 참조) — g2_min_profit_factor는 참고 지표로만 남기고
+  # 게이트 판정에는 더 이상 쓰지 않는다.
   g2_min_profit_factor: 1.3
+  g2_min_sharpe_annualized: 1.0
+  g2_min_calmar: 1.0
   g2_max_drawdown_pct: 15
   g2_min_positive_month_pct: 55
   g3_monte_carlo_runs: 1000
