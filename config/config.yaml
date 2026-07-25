@@ -108,6 +108,18 @@ walkforward:
     donchian_period: [15, 20, 25]
     trend_stop_atr_mult: [1.5, 2.0, 2.5]
 
+# 2026-07-25: 2a(횡단면 시장중립 모멘텀) + filtered_trend(trend+1a필터) 2다리
+# 포트폴리오 결합 배분. PORTFOLIO_2A_FILTEREDTREND_BACKTEST_NET.md에서 실현
+# 주간수익률 표준편차 기반 vol-parity로 1회 산출한 고정값 — 이 config가 로드될
+# 때마다 재계산하지 않는다(배분 로직 재탐색 금지, strategies/portfolio_combined.py
+# 참조). 값을 바꾸려면 반드시 새 진단 리포트로 재검증 후 갱신할 것.
+portfolio:
+  weights:
+    filtered_trend: 0.8531653464429574
+    2a: 0.14683465355704262
+  total_capital_usd: 10000  # account.initial_equity_usd와 동일 플레이스홀더, 신규 확정 아님
+  rebalance: "weekly"       # constant-mix(고정가중 주간 리밸런스), 복리
+
 gates:
   g2_min_oos_trades: 300
   g2_min_profit_factor: 1.3
