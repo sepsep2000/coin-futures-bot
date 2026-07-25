@@ -13,8 +13,11 @@ yaml에서 이 값들을 오버라이드할 수 있게 만들지 않은 것도 �
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import yaml
 
 CLUSTER_GAP_HOURS = 24
 N_BOOT = 5000
@@ -156,6 +159,33 @@ def series_correlation(a: pd.Series, b: pd.Series) -> dict:
     return {"n_weeks_compared": len(full_idx), "weekly_return_correlation": corr, "is_independent": corr < CORR_THRESHOLD}
 
 
+def load_accepted_signals(yaml_path: Path, project_root: Path, exclude_id: str | None = None) -> dict[str, pd.Series]:
+    """signal_specs/accepted_signals.yaml(PASS/ACCEPT 상태 신호 레지스트리)을 읽어
+    각 항목의 주간 수익률 시계열을 로드한다. exclude_id는 자기자신 비교를 막기 위한
+    자기제외(문자열 완전일치만 — 의미상 동일한 다른 id는 걸러지지 않으니 호출부에서
+    주의)."""
+    if not yaml_path.exists():
+        return {}
+    spec = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    out: dict[str, pd.Series] = {}
+    for entry in spec.get("accepted", []):
+        if entry["id"] == exclude_id:
+            continue
+        path = project_root / entry["weekly_returns_path"]
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        out[entry["id"]] = df.iloc[:, 0]
+    return out
+
+
+def multi_correlation_check(candidate_weekly: pd.Series, accepted: dict[str, pd.Series], threshold: float = CORR_THRESHOLD) -> dict:
+    """accepted_signals.yaml에 등록된 각 신호와 candidate의 주간수익률 상관계수를
+    전부 계산한다(reference_signal 하나만 보던 기존 STEP D의 확장). 임계치는
+    CORR_THRESHOLD 그대로 재사용 — 신호별로 조정하지 않는다."""
+    per_signal = {sig_id: series_correlation(candidate_weekly, s) for sig_id, s in accepted.items()}
+    redundant_with = [sig_id for sig_id, r in per_signal.items() if r["weekly_return_correlation"] >= threshold]
+    return {"per_signal": per_signal, "redundant_with": redundant_with}
+
+
 def correlation_matrix(series_dict: dict[str, pd.Series]) -> pd.DataFrame:
     """여러 신호의 주간 수익률 시계열을 받아 전체 쌍의 상관계수 행렬을 만든다
     (누적 매트릭스 — 새 신호가 검증될 때마다 이 함수에 딕셔너리를 늘려서 호출)."""
@@ -195,12 +225,20 @@ def net_neutral_check(daily_net_exposure_pct: pd.Series, portfolio_weekly_return
 # 최종 판정
 # ---------------------------------------------------------------------------
 
-def compute_verdict(step_c: dict, step_d: dict, corr_threshold: float = CORR_THRESHOLD) -> str:
-    """PASS / FAIL_NOT_SIGNIFICANT / FAIL_SIGNIFICANT_NEGATIVE / RECLASSIFY_AS_FILTER.
-    우선순위: 기존 신호와 상관 높으면(재포장 위험) 그것부터 — 통계적으로 유의해도
-    "새 신호"로 볼 수 없기 때문."""
+def compute_verdict(step_c: dict, step_d: dict, multi_corr: dict | None = None, corr_threshold: float = CORR_THRESHOLD) -> str:
+    """PASS / FAIL_NOT_SIGNIFICANT / FAIL_SIGNIFICANT_NEGATIVE / RECLASSIFY_AS_FILTER /
+    REDUNDANT_WITH_{id}. 우선순위:
+    1) reference_signal(보통 trend)과 상관 높으면 RECLASSIFY_AS_FILTER — 이건
+       "trend의 필터냐 아니냐"를 묻는 특수 케이스라 항상 최우선.
+    2) 이미 PASS/ACCEPT된 다른 신호(accepted_signals.yaml)와 상관 높으면
+       REDUNDANT_WITH_{id} — multi_corr가 주어졌을 때만 검사(기존 호출부 하위호환,
+       multi_corr=None이면 이 단계를 건너뛴다).
+    3) 그 외엔 유의성으로 PASS/FAIL 판정.
+    multi_corr가 None이면 기존(1세대/2세대) 동작과 완전히 동일하다."""
     if step_d.get("weekly_return_correlation", 0.0) >= corr_threshold:
         return "RECLASSIFY_AS_FILTER"
+    if multi_corr and multi_corr.get("redundant_with"):
+        return f"REDUNDANT_WITH_{multi_corr['redundant_with'][0]}"
     if step_c["mean_excludes_0"]:
         return "PASS" if step_c["point_mean_return_pct"] > 0 else "FAIL_SIGNIFICANT_NEGATIVE"
     return "FAIL_NOT_SIGNIFICANT"

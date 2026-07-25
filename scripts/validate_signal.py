@@ -357,6 +357,14 @@ def run_validation(spec_path: Path) -> dict:
     result["step_d"] = step_d
     cand_weekly.to_csv(out_dir / f"{sig_id}_weekly_returns.csv", header=["weekly_return"])
 
+    # STEP D 확장 — 이미 PASS/ACCEPT된 다른 신호들과의 상관관계(accepted_signals.yaml)
+    accepted_path = PROJECT_ROOT / "signal_specs" / "accepted_signals.yaml"
+    accepted = cv.load_accepted_signals(accepted_path, PROJECT_ROOT, exclude_id=sig_id)
+    multi_corr = cv.multi_correlation_check(cand_weekly, accepted) if accepted else None
+    result["multi_corr"] = multi_corr
+    if multi_corr is not None:
+        pd.DataFrame({k: v for k, v in multi_corr["per_signal"].items()}).T.to_csv(out_dir / f"{sig_id}_multi_corr.csv")
+
     # 넷중립 체크(옵션)
     if spec.get("requires_net_neutral_check"):
         btc_daily = gen_out["daily_close_for_btc"].pct_change().dropna()
@@ -365,7 +373,7 @@ def run_validation(spec_path: Path) -> dict:
         result["net_neutral"] = nn
         pd.Series(nn).to_csv(out_dir / f"{sig_id}_net_neutral.csv")
 
-    result["verdict"] = cv.compute_verdict(step_c, step_d)
+    result["verdict"] = cv.compute_verdict(step_c, step_d, multi_corr=multi_corr)
     _write_report(spec, result, out_dir, gen_out)
     return result
 
@@ -420,6 +428,16 @@ def _write_report(spec: dict, result: dict, out_dir: Path, gen_out: dict) -> Non
     else:
         d = result["step_d"]
         lines.append(f"- 비교 주수 {d['n_weeks_compared']}, 주간수익률 상관계수 {d['weekly_return_correlation']:.4f} — 독립(<{cv.CORR_THRESHOLD}): {d['is_independent']}")
+    lines.append("")
+
+    mc = result.get("multi_corr")
+    lines.append("## STEP D 확장. 기존 PASS/ACCEPT 신호들과의 상관관계 (accepted_signals.yaml)")
+    if not mc:
+        lines.append("해당 없음(accepted_signals.yaml 없음 또는 비교 대상 없음)")
+    else:
+        for sig_id2, r in mc["per_signal"].items():
+            lines.append(f"- vs {sig_id2}: 상관계수 {r['weekly_return_correlation']:.4f} (비교 주수 {r['n_weeks_compared']}) — 독립(<{cv.CORR_THRESHOLD}): {r['is_independent']}")
+        lines.append(f"- 중복 플래그: {mc['redundant_with'] if mc['redundant_with'] else '없음'}")
     lines.append("")
 
     if "net_neutral" in result:

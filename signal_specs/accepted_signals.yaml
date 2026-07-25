@@ -1,0 +1,22 @@
+# signal_specs/accepted_signals.yaml — PASS/ACCEPT 상태 신호 레지스트리
+#
+# checks.signal_validation.multi_correlation_check()의 비교 대상. 신규 신호가
+# PASS(신호) 또는 ACCEPT_AS_FILTER(필터)로 판정되면 이 파일에 항목을 추가한다.
+# weekly_returns_path의 CSV는 반드시 (exit_time index, weekly_return 컬럼) 형식
+# — scripts/validate_signal.py가 STEP D에서 저장하는 {id}_weekly_returns.csv와
+# 동일 스키마.
+#
+# ★ trend_filtered_1a는 signal_specs/1a.yaml 검증 시 이미 생성된
+#   reports/signal_validation_data/1a/1a_weekly_returns.csv를 그대로 가리킨다 —
+#   "1a 신호"와 "trend+1a필터"는 애초에 동일한 트레이드 집합이라 별도 재계산이
+#   필요 없다(gen_1a가 만드는 것 자체가 "trend를 1a 조건으로 거른 부분집합").
+
+accepted:
+  - id: "2a"
+    status: "PASS"
+    description: "횡단면 상대모멘텀(7일 lookback, 시장중립)"
+    weekly_returns_path: "reports/signal_validation_data/2a/2a_weekly_returns.csv"
+  - id: "trend_filtered_1a"
+    status: "ACCEPT_AS_FILTER"
+    description: "trend + 1a(1D 모멘텀 정합) 필터 — FILTER_VALIDATION_1a.md에서 재현성 확인"
+    weekly_returns_path: "reports/signal_validation_data/1a/1a_weekly_returns.csv"
