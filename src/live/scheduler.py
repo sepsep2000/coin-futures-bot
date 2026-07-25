@@ -25,19 +25,17 @@ docstring에 이미 실측됨). 주문 실행만 `cfg["mode"]`에 따라 testnet
 분기한다(`src.live.executor.get_authenticated_exchange`). 이 분리 자체가
 "페이퍼/라이브 동일 코드 경로" 원칙(설계 문서 5절)의 정확한 적용이다.
 
-★ 스켈레톤 대비 명시적 스코프 축소(사전 보고, 반드시 후속 과제 필요):
-filtered_trend의 라이브 포지션 관리는 **스탑로스 청산만** 구현한다.
-`_manage_trend_position`(engine.py)의 부분익절(partial_tp)·트레일링
-스탑·시간청산(time_stop) 로직은 `state.py`의 `positions` 스키마가
-`initial_stop`/`bars_held`/`partial_taken`/`funding_paid_usd` 등을
-저장하지 않아(설계 당시 확정된 스키마, 이번 태스크 범위에서 임의로
-바꾸지 않음) 그대로 재사용할 수 없다 — 이 세 경로를 라이브에 붙이려면
-스키마 확장이 선행돼야 한다. 즉시 스탑로스 청산은 과거 실측상 청산의
-대다수(68.1%, engine.py `_manage_trend_position` docstring 인용)를
-차지해 가장 중요한 안전장치는 구현돼 있지만, **부분익절/트레일링/시간
-청산이 빠진 채로는 백테스트가 검증한 것과 라이브 실제 동작이 정확히
-같지 않다** — G4(페이퍼 트레이딩) 착수 전 반드시 해소해야 할 간극으로
-남긴다(PAPER_TRADING_REMAINING_WORK.md에 추가 필요).
+★ [2026-07-25 해소] filtered_trend의 라이브 청산 로직 완성: `state.py`의
+`positions` 스키마를 확장(`initial_stop`/`entry_fee_usd`/
+`funding_paid_usd`/`partial_taken`)해 매 틱 `Position` 객체를 완전히
+재구성할 수 있게 됐고, `_manage_open_filtered_trend_position()`이
+engine.py의 `_manage_trend_position()`/`_apply_funding()`을 그대로
+호출한다(재해석 없음) — 부분익절/트레일링/시간청산/스탑로스 네 경로
+전부 백테스트와 동일 로직. 커버리지 재확인: reports/EXIT_LOGIC_COVERAGE.md
+(과거 68.1%→해당 문서의 실측 비율 참조). 실제 체결가는 시뮬레이션
+가격을 덮어써 telegram 보고에 쓴다(청산 여부/시점 판단 로직 자체는
+100% engine.py 소스, 보고되는 가격 숫자만 실측으로 교체 — bars_held는
+컬럼 저장 대신 entry_time에서 매 틱 계산).
 
 ★ 2a의 "안전장치"(ensure_stop_placed 통합, 태스크 명시 요구사항): 2a는
 설계상 스탑로스 개념이 없는 전략(주간 고정보유, 백테스트에 스탑 없음)
@@ -66,15 +64,15 @@ from typing import Optional
 
 import pandas as pd
 
-from src.backtest.cost_model import entry_fill_price
-from src.backtest.engine import _stop_hit
+from src.backtest.cost_model import entry_fill_price, taker_fee
+from src.backtest.engine import Position, SymbolData, _apply_funding, _current_r_multiple, _manage_trend_position
 from src.data.feed import cache_path, get_exchange, load_cache, update_funding_cache, update_ohlcv_cache
 from src.live import executor
 from src.live import state as live_state
 from src.notify import telegram
 from src.risk import can_open_new_position, daily_loss_limit_breached, position_size
 from src.strategy.regime import TREND, classify_regime
-from src.strategy.trend import generate_trend_signals
+from src.strategy.trend import generate_trend_signals, trailing_stop
 
 strategy_2a = importlib.import_module("strategies.2a")  # "2a"는 식별자로 import 불가 (portfolio_combined.py와 동일 관례)
 from strategies.filtered_trend import MOMENTUM_LOOKBACK_DAYS, SYMBOL as FT_SYMBOL, _momentum_agrees  # noqa: E402
@@ -297,20 +295,53 @@ def _qty_step_and_min(exchange, symbol: str) -> tuple[float, float]:
     return market["precision"]["amount"], market["limits"]["amount"]["min"]
 
 
+def _compute_bars_held(entry_time: pd.Timestamp, ts: pd.Timestamp) -> int:
+    """engine.py의 Position.bars_held와 동일 정의(진입 이후 관리 호출
+    횟수) — 컬럼으로 저장하지 않고 entry_time에서 매 틱 계산한다(상태
+    이중관리 방지, 재시작에도 안전). 백테스트 루프에서 bars_held는 진입
+    봉 자체에서는 0(관리 호출 안 됨)이고, 그다음 봉부터 관리 호출마다
+    1씩 늘어난다 — 즉 진입 이후 경과한 완결 15분 봉 수와 정확히 같다."""
+    return int((ts - entry_time) / pd.Timedelta(minutes=15))
+
+
+def _reconstruct_filtered_trend_position(pos: dict, ts: pd.Timestamp) -> Position:
+    """state.py에 저장된 행 -> engine.py의 Position 데이터클래스. strategy
+    필드는 state.py의 부기 라벨("filtered_trend")이 아니라 filtered_trend.py
+    ::run()이 쓰는 값("trend")을 그대로 쓴다 — Position.strategy는 Trade
+    레코드 라벨용으로 다른 이름공간(EXIT_LOGIC_COVERAGE.md에 명시)."""
+    entry_time = pd.Timestamp(pos["entry_time"])
+    initial_stop = pos["initial_stop"]
+    return Position(
+        symbol=pos["symbol"], strategy="trend", direction=pos["direction"],
+        entry_time=entry_time, entry_price=pos["entry_price"], qty=pos["qty"],
+        initial_stop=initial_stop, current_stop=pos["current_stop"],
+        initial_stop_distance=abs(pos["entry_price"] - initial_stop),
+        target_price=None, partial_taken=bool(pos["partial_taken"]),
+        bars_held=_compute_bars_held(entry_time, ts),
+        entry_fee_usd=pos["entry_fee_usd"], funding_paid_usd=pos["funding_paid_usd"],
+    )
+
+
 def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_exchange, ts: pd.Timestamp,
                                   total_equity: float, entries_blocked: bool) -> None:
-    """filtered_trend 처리. 스코프(모듈 docstring 참조): 청산은 스탑로스만,
-    신규진입은 strategies/filtered_trend.py와 동일한 신호 함수로 판단."""
+    """filtered_trend 처리. 청산 관리는 engine.py의 _manage_trend_position()을
+    그대로 호출한다(부분익절/트레일링/시간청산/스탑로스 전부 포함 — 재해석
+    없음, EXIT_LOGIC_COVERAGE.md). 신규진입은 strategies/filtered_trend.py와
+    동일한 신호 함수로 판단."""
     account_cfg = cfg["account"]
+    trend_cfg, cost_cfg = cfg["trend"], cfg["costs"]
     project_root = Path(__file__).resolve().parent.parent.parent
     ohlcv_dir = project_root / cfg["data"]["ohlcv_cache_dir"]
+    funding_dir = project_root / cfg["data"]["funding_cache_dir"]
     since_ms = int((ts - pd.Timedelta(days=DATA_LOOKBACK_DAYS_15M)).timestamp() * 1000)
     update_ohlcv_cache(data_exchange, FT_SYMBOL, "15m", since_ms, ohlcv_dir)
     update_ohlcv_cache(data_exchange, FT_SYMBOL, "1h", since_ms, ohlcv_dir)
+    update_funding_cache(data_exchange, FT_SYMBOL, since_ms, funding_dir)
 
     df_15m = _load_and_index(cache_path(ohlcv_dir, FT_SYMBOL, "15m"))
     df_1h = _load_and_index(cache_path(ohlcv_dir, FT_SYMBOL, "1h"))
-    if df_15m is None or df_1h is None or df_15m.empty:
+    funding_df = load_cache(cache_path(funding_dir, FT_SYMBOL, "funding"))
+    if df_15m is None or df_1h is None or df_15m.empty or funding_df is None:
         _log_stderr("filtered_trend: 캐시 데이터 없음 - 이번 틱 스킵")
         return
     # 캐시는 2023년부터의 전체 백테스트 이력을 공유한다(같은 parquet 경로) —
@@ -325,27 +356,16 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
     latest_bar = df_15m.iloc[-1]
 
     if positions:
-        pos = positions[0]
-        stub_position = SimpleNamespace(direction=pos["direction"], current_stop=pos["current_stop"])
-        if _stop_hit(stub_position, latest_bar):
-            close_direction = "short" if pos["direction"] == "long" else "long"
-            result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, close_direction, pos["qty"])
-            if result.status == "filled":
-                live_state.delete_position(db_path, FT_SYMBOL, "filtered_trend")
-                telegram.send_entry_exit_notification(
-                    symbol=FT_SYMBOL, strategy="filtered_trend", direction=pos["direction"], regime="trend",
-                    qty=pos["qty"], price=result.avg_fill_price or latest_bar["close"],
-                    r_multiple=None,  # initial_stop 미보존(스코프 축소, 모듈 docstring) - R배수 계산 불가
-                    cumulative_pnl_usd=total_equity - account_cfg["initial_equity_usd"],
-                )
-        return  # 포지션이 있으면(청산했든 안 했든) 이번 틱엔 신규진입 평가 안 함
+        _manage_open_filtered_trend_position(db_path, exec_exchange, positions[0], df_15m, df_1h, funding_df,
+                                              trend_cfg, cost_cfg, ts, latest_bar, total_equity, account_cfg)
+        return  # 포지션이 있으면(청산했든 아니든) 이번 틱엔 신규진입 평가 안 함
 
     if entries_blocked:
         return
     if not can_open_new_position(set(), FT_SYMBOL, account_cfg["max_concurrent_positions"]):
         return
 
-    regime_cfg, trend_cfg = cfg["regime"], cfg["trend"]
+    regime_cfg = cfg["regime"]
     regime_1h = classify_regime(df_1h, regime_cfg)
     regime_15m = regime_1h.reindex(df_15m.index, method="ffill")
     if regime_15m.iloc[-1] != TREND:
@@ -362,7 +382,7 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
         return
 
     initial_stop = trow["initial_stop_long"] if direction == "long" else trow["initial_stop_short"]
-    entry_price = entry_fill_price(latest_bar["close"], direction, cfg["costs"]["slippage_pct"], "market")
+    entry_price = entry_fill_price(latest_bar["close"], direction, cost_cfg["slippage_pct"], "market")
     leg_equity = total_equity * cfg["portfolio"]["weights"]["filtered_trend"]
     step, minq = _qty_step_and_min(exec_exchange, FT_SYMBOL)
     qty = position_size(leg_equity, entry_price, initial_stop, account_cfg["risk_per_trade_pct"],
@@ -373,15 +393,91 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
     result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, direction, qty)
     if result.status != "filled":
         return
+    real_entry_price = result.avg_fill_price or entry_price
+    notional = qty * real_entry_price
+    entry_fee_usd = taker_fee(notional, cost_cfg["taker_fee_pct"])  # filtered_trend.py::run()의 진입 수수료 계산과 동일
     live_state.save_position(db_path, FT_SYMBOL, "filtered_trend", direction, qty,
-                              result.avg_fill_price or entry_price, ts.isoformat(), initial_stop)
+                              real_entry_price, ts.isoformat(), initial_stop,
+                              initial_stop=initial_stop, entry_fee_usd=entry_fee_usd,
+                              funding_paid_usd=0.0, partial_taken=False)
     executor.ensure_stop_placed(exec_exchange, db_path, FT_SYMBOL,
                                  SimpleNamespace(direction=direction, qty=qty, current_stop=initial_stop))
     telegram.send_entry_exit_notification(
         symbol=FT_SYMBOL, strategy="filtered_trend", direction=direction, regime="trend",
-        qty=qty, price=result.avg_fill_price or entry_price, r_multiple=None,
+        qty=qty, price=real_entry_price, r_multiple=None,
         cumulative_pnl_usd=total_equity - account_cfg["initial_equity_usd"],
     )
+
+
+def _manage_open_filtered_trend_position(db_path: Path, exec_exchange, pos: dict, df_15m: pd.DataFrame,
+                                          df_1h: pd.DataFrame, funding_df: pd.DataFrame,
+                                          trend_cfg: dict, cost_cfg: dict, ts: pd.Timestamp, latest_bar: pd.Series,
+                                          total_equity: float, account_cfg: dict) -> None:
+    """이미 열린 filtered_trend 포지션 1틱 관리 — engine.py::_manage_trend_position()을
+    그대로 호출(부분익절/트레일링/시간청산/스탑로스, 재해석 없음). 실제
+    청산 주문은 반환된 Trade별로 개별 실행하고(부분익절 후 같은 틱에서
+    시간청산까지 겹치면 Trade가 2건일 수 있음, engine.py 로직 그대로),
+    telegram에는 시뮬레이션 가격이 아니라 실제 체결가를 보고한다(_manage_
+    trend_position의 결정 로직은 그대로, 보고되는 숫자만 실측으로 교체).
+
+    ★ 상태 갱신은 "전부 체결됐을 때만" 한다 — 청산 주문이 미체결이면
+    _manage_trend_position이 "이렇게 됐어야 한다"고 계산한 결과(qty 축소/
+    포지션 삭제 등)를 실제로 일어나지 않은 일처럼 state에 반영하지 않는다
+    (gate_verify.py의 공허한 PASS 버그와 같은 종류의 실수 반복 금지 —
+    이번 태스크 이전 세션에서 이미 한 번 지적됐던 원칙). 미체결 시 포지션
+    행은 건드리지 않고(직전 상태 그대로 유지) CRITICAL만 발신, 다음 틱에서
+    재시도된다.
+
+    ★ 알려진 한계: 한 틱에서 Trade가 2건(예: 부분익절 성공 직후 같은 틱에서
+    시간청산까지 트리거) 나올 때 첫 번째만 체결되고 두 번째가 실패하면,
+    실제로는 부분청산이 일어났는데도 state는 갱신하지 않는다(all-or-nothing
+    단순화) — 다음 틱에서 같은 부분익절 조건이 다시 트리거돼 중복 청산
+    시도가 발생할 수 있다. 두 Trade가 같은 틱에 겹치는 경우 자체가 드물고
+    (부분익절 임계치와 시간청산 임계치가 같은 봉에서 동시 충족돼야 함),
+    완전한 해결은 트레이드 단위로 state를 즉시 갱신하는 재설계가 필요해
+    이번 범위 밖으로 남긴다."""
+    position = _reconstruct_filtered_trend_position(pos, ts)
+    trend_row = pd.Series({"chandelier_stop": trailing_stop(df_15m, trend_cfg, position.direction).iloc[-1]})
+
+    new_position, trades, _simulated_realized = _manage_trend_position(position, latest_bar, trend_row, trend_cfg, cost_cfg)
+
+    close_direction = "short" if position.direction == "long" else "long"
+    all_filled = True
+    for trade in trades:
+        result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, close_direction, trade.qty)
+        if result.status != "filled":
+            all_filled = False
+            telegram.send_critical_alert(
+                f"filtered_trend 청산 주문({trade.exit_reason}) 미체결 - 수동 확인 필요: {FT_SYMBOL} qty={trade.qty}"
+            )
+            continue
+        real_r_multiple = _current_r_multiple(position, result.avg_fill_price)
+        telegram.send_entry_exit_notification(
+            symbol=FT_SYMBOL, strategy="filtered_trend", direction=position.direction, regime="trend",
+            qty=trade.qty, price=result.avg_fill_price, r_multiple=real_r_multiple,
+            cumulative_pnl_usd=total_equity - account_cfg["initial_equity_usd"],
+        )
+
+    if not all_filled:
+        return  # 상태 미갱신 - 다음 틱에서 _manage_trend_position이 같은 조건을 다시 평가해 재시도
+
+    if new_position is None:
+        live_state.delete_position(db_path, FT_SYMBOL, "filtered_trend")
+        return
+
+    symbol_data = SymbolData(df_15m=df_15m, df_1h=df_1h, funding=funding_df)
+    ts_ms = int(ts.value // 1_000_000)
+    _apply_funding(new_position, symbol_data, ts_ms, cost_cfg)
+
+    live_state.save_position(
+        db_path, FT_SYMBOL, "filtered_trend", new_position.direction, new_position.qty,
+        new_position.entry_price, new_position.entry_time.isoformat(), new_position.current_stop,
+        initial_stop=new_position.initial_stop, entry_fee_usd=new_position.entry_fee_usd,
+        funding_paid_usd=new_position.funding_paid_usd, partial_taken=new_position.partial_taken,
+    )
+    executor.ensure_stop_placed(exec_exchange, db_path, FT_SYMBOL,
+                                 SimpleNamespace(direction=new_position.direction, qty=new_position.qty,
+                                                  current_stop=new_position.current_stop))
 
 
 def _load_and_index(path: Path):
