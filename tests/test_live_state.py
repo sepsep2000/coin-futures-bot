@@ -6,6 +6,7 @@ from src.live.state import (
     ReconciliationResult,
     delete_position,
     init_db,
+    load_equity_snapshots_since,
     load_open_positions,
     load_pending_orders,
     recover_state,
@@ -133,3 +134,18 @@ def test_order_status_transition_removes_from_pending(db_path):
 def test_save_equity_snapshot_and_rebalance_log_do_not_raise(db_path):
     save_equity_snapshot(db_path, "2026-07-25T00:00:00Z", 1000.0, 838.3, 161.7)
     save_rebalance_log(db_path, "2026-07-25T00:00:00Z", ["BTC", "ETH"], ["SOL"], [], ["XRP"], 25.0, 12.5)
+
+
+def test_load_equity_snapshots_since_filters_and_orders_ascending(db_path):
+    save_equity_snapshot(db_path, "2026-07-19T00:00:00Z", 900.0, 800.0, 100.0)  # 필터 범위 밖(이전 날짜)
+    save_equity_snapshot(db_path, "2026-07-20T06:00:00Z", 1000.0, 838.3, 161.7)
+    save_equity_snapshot(db_path, "2026-07-20T00:15:00Z", 950.0, 800.0, 150.0)
+
+    rows = load_equity_snapshots_since(db_path, "2026-07-20T00:00:00Z")
+
+    assert [r["ts"] for r in rows] == ["2026-07-20T00:15:00Z", "2026-07-20T06:00:00Z"]
+
+
+def test_load_equity_snapshots_since_empty_when_none_match(db_path):
+    save_equity_snapshot(db_path, "2026-07-19T00:00:00Z", 900.0, 800.0, 100.0)
+    assert load_equity_snapshots_since(db_path, "2026-07-20T00:00:00Z") == []
