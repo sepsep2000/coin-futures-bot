@@ -72,7 +72,17 @@ def get_authenticated_exchange(testnet: bool = True) -> ccxt.Exchange:
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {"disableFuturesSandboxWarning": True},
+        "options": {
+            "disableFuturesSandboxWarning": True,
+            # 2026-07-25 실측 확인(src/live/runner.py 실제 testnet 통합 테스트 중 발견):
+            # recover_state()가 심볼 지정 없이 fetch_open_orders()를 호출하는데(계좌
+            # 전체의 미체결 주문을 봐야 하므로 — filtered_trend/2a가 서로 다른 심볼을
+            # 쓴다), ccxt 기본값은 이걸 ExchangeError로 막는다("계정 전체 조회는 레이트
+            # 리밋이 10~40배"라는 경고를 에러로 승격시킴). 이 옵션으로 그 경고를
+            # 끈다 — 실제 호출 자체는 정상 동작함(엔드포인트가 막힌 게 아니라 ccxt의
+            # 방어적 기본값일 뿐, disableFuturesSandboxWarning과 동일한 종류의 우회).
+            "fetchOpenOrders": {"warnWithoutSymbol": False},
+        },
     })
     if testnet:
         exchange.set_sandbox_mode(True)

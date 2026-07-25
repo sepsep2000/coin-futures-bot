@@ -275,3 +275,16 @@ def test_get_authenticated_exchange_missing_keys_raises_without_leaking(monkeypa
         executor.get_authenticated_exchange(testnet=True)
 
     assert "테스트넷" in str(excinfo.value)
+
+
+def test_get_authenticated_exchange_disables_fetch_open_orders_symbol_warning(monkeypatch, tmp_path):
+    """★ 실측으로 발견한 버그의 회귀 테스트(src/live/runner.py 실제 testnet
+    통합 테스트 중 발견): recover_state()가 심볼 없이 fetch_open_orders()를
+    호출하는데, 이 옵션이 없으면 ccxt가 ExchangeError로 막는다."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("BINANCE_TESTNET_API_KEY=fake\nBINANCE_TESTNET_API_SECRET=fake\n", encoding="utf-8")
+    monkeypatch.setattr(executor, "ENV_PATH", env_file)
+
+    exchange = executor.get_authenticated_exchange(testnet=True)
+
+    assert exchange.options["fetchOpenOrders"]["warnWithoutSymbol"] is False
