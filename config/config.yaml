@@ -117,10 +117,17 @@ walkforward:
 # 정정한 값으로 교체(기존 0.8532/0.1468 -> 0.8383/0.1617). 재탐색 아님 — 같은
 # vol-parity 공식을 정정된 leg1(filtered_trend) 데이터로 다시 계산한 결과.
 # 상세: reports/VOL_PARITY_RECALC.md, reports/diag_data/audit_vol_parity_sensitivity.csv
+# 2026-07-25 재갱신: 2a의 라이브 유니버스를 ETH 제외 19자산으로 정식 채택
+# (2A_ETH_EXCLUSION_IMPACT.md)한 데 따라, 그 19자산 2a의 실제 변동성으로
+# vol-parity 공식을 다시 적용(0.8383/0.1617 -> 0.8563/0.1437). 여전히 재탐색
+# 아님 — 같은 공식, sigma2(2a 변동성)만 실제 라이브 유니버스 기준으로 교체.
+# G2/G3 게이트는 새 가중치에서도 PASS 유지(Sharpe 1.843/Calmar 3.446/
+# MaxDD 6.58%/MC MaxDD95% 10.55% — 15% 임계치에 근접하지 않음). 다만 20자산
+# 기준 대비 여유폭은 줄었다(상세: reports/VOL_PARITY_19ASSET_RECALC.md).
 portfolio:
   weights:
-    filtered_trend: 0.8383017180188289
-    2a: 0.1616982819811711
+    filtered_trend: 0.8562663620801656
+    2a: 0.1437336379198344
   total_capital_usd: 10000  # account.initial_equity_usd와 동일 플레이스홀더, 신규 확정 아님
   rebalance: "weekly"       # constant-mix(고정가중 주간 리밸런스), 복리
 
