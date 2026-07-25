@@ -1,0 +1,9 @@
+id,category,n_events,point_mean,verdict,batch
+3a,meanrev,2459,-0.0492%,FAIL_SIGNIFICANT_NEGATIVE,1세대
+3b,meanrev,410,-0.0430%,FAIL_NOT_SIGNIFICANT,1세대
+1a,multi_horizon_trend,633,0.7219R,RECLASSIFY_AS_FILTER,1세대
+2a,cross_sectional_momentum,185,1.4001%,PASS,1세대
+4a,volatility_regime_transition,2993,0.0273%,FAIL_NOT_SIGNIFICANT,1세대
+4b,volatility_regime_transition,2474,0.0090%,FAIL_NOT_SIGNIFICANT,1세대
+5a,cross_sectional_carry,186,0.7051%,FAIL_NOT_SIGNIFICANT,2세대
+5b,cross_sectional_momentum,181,0.7200%,FAIL_NOT_SIGNIFICANT,2세대
