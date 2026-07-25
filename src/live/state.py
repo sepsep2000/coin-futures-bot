@@ -189,6 +189,18 @@ def load_pending_orders(db_path: Path) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def load_equity_snapshots_since(db_path: Path, since_iso: str) -> list[dict]:
+    """ts >= since_iso인 스냅샷 전부, ts 오름차순 — src/live/scheduler.py의
+    일일 손실한도 계산(오늘 첫 스냅샷 대비 현재 자본 변화)에 필요해 추가.
+    save_equity_snapshot()의 대응 조회 함수가 원래 없었다(쓰기만 있고
+    읽기가 없어 킬스위치 로직이 과거 스냅샷을 조회할 방법이 없었음)."""
+    with closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC", (since_iso,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def save_equity_snapshot(db_path: Path, ts: str, total_equity_usd: float,
                           filtered_trend_equity_usd: float, two_a_equity_usd: float) -> None:
     """일일 손실한도 계산 + 일일 요약 알림용."""
