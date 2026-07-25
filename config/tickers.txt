@@ -1,0 +1,33 @@
+# config/tickers.txt — 데이터 수집용 자산 유니버스 (Phase 0-R, 3->20 확장)
+#
+# 선정 기준(REDESIGN_PROPOSAL.md STEP 2):
+#   Binance USDT-M 무기한선물(linear swap) + 2023-01-01 이전 상장(info.onboardDate)
+#   + 24h 거래대금(quoteVolume) 상위 20. 선정 시각: 2026-07-25(스크립트 실행 시점,
+#   거래대금은 그 시점 스냅샷 — 리밸런스 기준 아님, 1회성 유니버스 확정).
+#
+# ★ 이 파일은 config.yaml의 exchange.pairs(실제 전략 활성 자산)와 별개다.
+#   순수 데이터 수집 범위만 정의한다 — 여기 자산을 추가한다고 전략이 그 자산을
+#   거래하게 되는 것은 아니다.
+#
+# 기존 3자산(BTC/ETH/SOL)은 이미 거래대금 상위 3위라 자연스럽게 포함됨.
+
+BTC/USDT:USDT
+ETH/USDT:USDT
+SOL/USDT:USDT
+XRP/USDT:USDT
+ZEC/USDT:USDT
+DOGE/USDT:USDT
+BNB/USDT:USDT
+NEAR/USDT:USDT
+ADA/USDT:USDT
+LINK/USDT:USDT
+UNI/USDT:USDT
+AVAX/USDT:USDT
+XLM/USDT:USDT
+AAVE/USDT:USDT
+LTC/USDT:USDT
+INJ/USDT:USDT
+TRX/USDT:USDT
+DOT/USDT:USDT
+BCH/USDT:USDT
+XMR/USDT:USDT
