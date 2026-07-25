@@ -1,0 +1,8 @@
+,0
+n_events_raw,196.0
+n_independent_clusters,79.0
+cluster_size_mean,2.481012658227848
+cluster_size_median,2.0
+cluster_size_max,10.0
+pct_events_in_clusters_ge2,80.61224489795919
+lo_threshold_funding_rate,-3.65925e-05
