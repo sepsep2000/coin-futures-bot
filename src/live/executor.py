@@ -81,6 +81,16 @@ def get_authenticated_exchange(testnet: bool = True) -> ccxt.Exchange:
             # 리밋이 10~40배"라는 경고를 에러로 승격시킴). 이 옵션으로 그 경고를
             # 끈다 — 실제 호출 자체는 정상 동작함(엔드포인트가 막힌 게 아니라 ccxt의
             # 방어적 기본값일 뿐, disableFuturesSandboxWarning과 동일한 종류의 우회).
+            #
+            # 2026-07-26 보강: ccxt/binance.py 실제 조건문을 직접 읽어 확인한 결과
+            # (.venv/Lib/site-packages/ccxt/binance.py:7128-7131) —
+            #   warnWithoutSymbol = self.options['fetchOpenOrders']['warnWithoutSymbol']
+            #   optValue = self.options['warnOnFetchOpenOrdersWithoutSymbol']  # 하위호환용
+            #   if optValue or (optValue is None and warnWithoutSymbol): raise ExchangeError
+            # 위 nested 옵션 하나로 이미 충분(optValue가 None이면 nested 값을 본다).
+            # 그래도 상위호환용 플래그도 같이 꺼서 이중 안전장치(ccxt 버전이 바뀌어도
+            # 안전하도록) — 둘 중 하나가 True로 남아있어도 절대 경고를 되살리지 않는다.
+            "warnOnFetchOpenOrdersWithoutSymbol": False,
             "fetchOpenOrders": {"warnWithoutSymbol": False},
         },
     })

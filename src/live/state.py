@@ -173,6 +173,17 @@ def load_metadata(db_path: Path, key: str) -> Optional[str]:
         return row["value"] if row else None
 
 
+def delete_metadata(db_path: Path, key: str) -> None:
+    """2026-07-26 추가 — 잘못 기록된 메타데이터를 무효화할 방법이 없었다
+    (예: 크래시로 죽은 runner.py 시도가 G4 시작 시각을 잘못 박제한 경우).
+    삭제 후 load_metadata()는 다시 None을 반환하므로, save_g4_start_
+    timestamp()의 "최초 1회만 기록" 로직이 다음 정상 실행을 진짜 최초로
+    인식한다."""
+    with closing(_connect(db_path)) as conn:
+        conn.execute("DELETE FROM metadata WHERE key = ?", (key,))
+        conn.commit()
+
+
 G4_START_TIMESTAMP_KEY = "g4_start_timestamp"
 
 

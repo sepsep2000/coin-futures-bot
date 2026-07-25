@@ -5,6 +5,7 @@ import pytest
 
 from src.live.state import (
     ReconciliationResult,
+    delete_metadata,
     delete_position,
     init_db,
     load_equity_snapshots_since,
@@ -235,6 +236,27 @@ def test_save_metadata_upserts_existing_key(db_path):
     save_metadata(db_path, "k", "v1")
     save_metadata(db_path, "k", "v2")
     assert load_metadata(db_path, "k") == "v2"
+
+
+def test_delete_metadata_makes_load_return_none_again(db_path):
+    save_metadata(db_path, "k", "v1")
+    delete_metadata(db_path, "k")
+    assert load_metadata(db_path, "k") is None
+
+
+def test_delete_metadata_missing_key_does_not_raise(db_path):
+    delete_metadata(db_path, "never_set")  # 예외 없이 조용히 무시
+
+
+def test_delete_metadata_then_save_g4_start_timestamp_records_as_fresh(db_path):
+    """★ 잘못 기록된 G4 시작시각을 무효화한 뒤 다음 정상 실행이 진짜
+    최초로 인식되는지 확인(이번 태스크의 실제 목적)."""
+    save_g4_start_timestamp(db_path, "2026-07-25T15:05:01+00:00")  # 크래시로 죽은 시도가 잘못 남긴 값
+    delete_metadata(db_path, "g4_start_timestamp")
+    assert load_g4_start_timestamp(db_path) is None
+
+    save_g4_start_timestamp(db_path, "2026-07-26T00:00:00+00:00")  # 다음 정상 실행
+    assert load_g4_start_timestamp(db_path) == "2026-07-26T00:00:00+00:00"
 
 
 def test_save_and_load_g4_start_timestamp_roundtrip(db_path):
