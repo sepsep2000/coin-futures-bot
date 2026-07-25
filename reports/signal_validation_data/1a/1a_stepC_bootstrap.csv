@@ -1,0 +1,11 @@
+,0
+n_clusters,280
+n_events,633
+point_mean_return_pct,72.19107057641197
+mean_ci_lo_pct,59.914401319852885
+mean_ci_hi_pct,83.93907457755135
+mean_excludes_0,True
+point_pf,3.2443330314875287
+pf_ci_lo,2.6805147174167105
+pf_ci_hi,3.9080410839181092
+pf_excludes_1,True

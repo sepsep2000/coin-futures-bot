@@ -1,0 +1,8 @@
+,0
+n_assets,20
+mean_pairwise_corr_20,0.586470326262829
+mean_pairwise_corr_btc_eth_sol,0.757427479500966
+corr_gt_0.3,1
+corr_gt_0.5,4
+corr_gt_0.7,12
+verdict_pass_2a_proceed,True

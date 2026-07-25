@@ -1,0 +1,7 @@
+id,category,n_events,point_mean,verdict,batch
+3a,meanrev,2459,-0.0492%,FAIL_SIGNIFICANT_NEGATIVE,이전 세션
+3b,meanrev,410,-0.0430%,FAIL_NOT_SIGNIFICANT,이전 세션
+1a,multi_horizon_trend,633,0.7219R,RECLASSIFY_AS_FILTER,이번 배치
+2a,cross_sectional_momentum,185,1.4001%,PASS,이번 배치
+4a,volatility_regime_transition,2993,0.0273%,FAIL_NOT_SIGNIFICANT,이번 배치
+4b,volatility_regime_transition,2474,0.0090%,FAIL_NOT_SIGNIFICANT,이번 배치
