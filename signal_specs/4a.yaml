@@ -1,0 +1,10 @@
+# signal_specs/4a.yaml — 변동성 압축 후 확장(스퀴즈 브레이크아웃) (REDESIGN_PROPOSAL.md STEP 1, 카테고리 4)
+id: "4a"
+category: "volatility_regime_transition"
+description: "변동성 압축 후 확장 — BB폭 백분위가 RANGE 임계치(<40) 아래였다가 TREND 임계치(>=60) 위로 전환하는 순간 진입"
+generator: "gen_4a"
+regime_filter: "TREND"       # 전환 시점이 TREND 레짐 진입 직전/직후라 STEP A 계산 대상
+reference_signal: "trend"
+requires_net_neutral_check: false
+params:
+  time_exit_bars: 48          # 3a/3b와 동일 값 재사용, 신규 수치 아님

@@ -1,0 +1,11 @@
+# signal_specs/1a.yaml — 1D 모멘텀 정합 필터 (REDESIGN_PROPOSAL.md STEP 1, 카테고리 1)
+id: "1a"
+category: "multi_horizon_trend"
+description: "1D 모멘텀 정합 필터 — 기존 trend 신호 중 1D ROC와 방향이 일치하는 것만 채택"
+generator: "gen_1a"
+regime_filter: "TREND"      # trend와 동일 레짐 기반이라 STEP A 계산 대상
+reference_signal: "trend"
+requires_net_neutral_check: false
+return_units: "r_multiple"    # trend의 r_multiple을 그대로 재사용(청산 로직 재사용 명세라 당연) — % 아님
+params:
+  momentum_lookback_days: 5   # REDESIGN_PROPOSAL.md 예시값 그대로, 스윕 없음

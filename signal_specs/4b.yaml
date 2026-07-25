@@ -1,0 +1,10 @@
+# signal_specs/4b.yaml — ADX 저점 반전(추세 조기 진입) (REDESIGN_PROPOSAL.md STEP 1, 카테고리 4)
+id: "4b"
+category: "volatility_regime_transition"
+description: "ADX 저점 반전 — ADX가 국소 저점 찍고 3봉 연속 상승 전환(아직 TREND 임계치 미만)하는 조기 진입"
+generator: "gen_4b"
+regime_filter: "TREND"       # trend의 조기 진입 버전이라 STEP A 계산 대상(높은 중첩 예상)
+reference_signal: "trend"
+requires_net_neutral_check: false
+params:
+  time_exit_bars: 48          # 3a/3b와 동일 값 재사용, 신규 수치 아님

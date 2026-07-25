@@ -8,6 +8,10 @@
 !/reports/diag_data/
 /reports/diag_data/*
 !/reports/diag_data/*.csv
+!/reports/signal_validation_data/
+/reports/signal_validation_data/**
+!/reports/signal_validation_data/**/
+!/reports/signal_validation_data/**/*.csv
 __pycache__/
 *.pyc
 .pytest_cache/

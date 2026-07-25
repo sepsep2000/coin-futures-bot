@@ -1,0 +1,10 @@
+# signal_specs/2a.yaml — 횡단면 상대모멘텀 랭킹(시장중립) (REDESIGN_PROPOSAL.md STEP 1, 카테고리 2)
+id: "2a"
+category: "cross_sectional_momentum"
+description: "횡단면 상대모멘텀 랭킹(시장중립) — 20자산 유니버스, 상하위 4분위 롱숏, 주간 리밸런스"
+generator: "gen_2a"
+regime_filter: null          # 단일자산 레짐 개념 없음 — STEP A 해당 없음
+reference_signal: "trend"
+requires_net_neutral_check: true
+params:
+  lookback_days: 7            # REDESIGN_PROPOSAL.md 예시값 그대로, 스윕 없음
