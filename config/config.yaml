@@ -113,10 +113,14 @@ walkforward:
 # 주간수익률 표준편차 기반 vol-parity로 1회 산출한 고정값 — 이 config가 로드될
 # 때마다 재계산하지 않는다(배분 로직 재탐색 금지, strategies/portfolio_combined.py
 # 참조). 값을 바꾸려면 반드시 새 진단 리포트로 재검증 후 갱신할 것.
+# 2026-07-25 갱신: POST_FILTER_BUG_AUDIT.md에서 확인된 사후필터링 데이터 오염을
+# 정정한 값으로 교체(기존 0.8532/0.1468 -> 0.8383/0.1617). 재탐색 아님 — 같은
+# vol-parity 공식을 정정된 leg1(filtered_trend) 데이터로 다시 계산한 결과.
+# 상세: reports/VOL_PARITY_RECALC.md, reports/diag_data/audit_vol_parity_sensitivity.csv
 portfolio:
   weights:
-    filtered_trend: 0.8531653464429574
-    2a: 0.14683465355704262
+    filtered_trend: 0.8383017180188289
+    2a: 0.1616982819811711
   total_capital_usd: 10000  # account.initial_equity_usd와 동일 플레이스홀더, 신규 확정 아님
   rebalance: "weekly"       # constant-mix(고정가중 주간 리밸런스), 복리
 
