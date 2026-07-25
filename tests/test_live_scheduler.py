@@ -504,3 +504,95 @@ def test_manage_open_position_partial_tp_reduces_qty_and_moves_stop_to_breakeven
     assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": pytest.approx(0.25)}]
     assert len(sent) == 1
     assert sent[0]["price"] == 107.6
+
+
+# =====================================================================
+# 연속오류 킬스위치 (2026-07-25 추가 — SPEC 2.4)
+# =====================================================================
+
+def test_run_live_loop_triggers_kill_switch_after_threshold_consecutive_failures(db_path, monkeypatch):
+    """★ N=5(SPEC 2.4, 임의 축소 금지) 연속 실패해야 발동 - 그 전엔 계속 재시도."""
+    monkeypatch.setattr(scheduler, "get_exchange", lambda testnet=False: object())
+    monkeypatch.setattr(scheduler.executor, "get_authenticated_exchange", lambda testnet=True: _StubReconciledExchange())
+    monkeypatch.setattr(scheduler.live_state, "recover_state",
+                         lambda db, ex: SimpleNamespace(positions_match=True, orders_match=True, mismatches=[]))
+    monkeypatch.setattr(scheduler, "_sleep_until_next_tick", lambda ts: None)
+
+    def _boom(cfg, db, dex, eex, ts):
+        raise RuntimeError("simulated persistent failure")
+
+    monkeypatch.setattr(scheduler, "_tick", _boom)
+    liquidation_calls = []
+    monkeypatch.setattr(scheduler, "_execute_kill_switch_liquidation",
+                         lambda db, ex, count: liquidation_calls.append(count))
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: True)
+
+    # max_iterations를 넉넉히(10) 줘도 5회째에서 멈춰야 한다(발동 즉시 반환)
+    scheduler.run_live_loop({"mode": "testnet"}, db_path, max_iterations=10)
+
+    assert liquidation_calls == [5]  # 정확히 5번째 실패에서 1회만 발동
+
+
+def test_run_live_loop_success_resets_consecutive_error_counter(db_path, monkeypatch):
+    """실패-실패-실패-실패-성공-실패-실패-실패-실패 처럼 중간에 성공이 끼면
+    카운터가 리셋돼 5연속이 안 채워지면 킬스위치가 발동하지 않아야 한다."""
+    monkeypatch.setattr(scheduler, "get_exchange", lambda testnet=False: object())
+    monkeypatch.setattr(scheduler.executor, "get_authenticated_exchange", lambda testnet=True: _StubReconciledExchange())
+    monkeypatch.setattr(scheduler.live_state, "recover_state",
+                         lambda db, ex: SimpleNamespace(positions_match=True, orders_match=True, mismatches=[]))
+    monkeypatch.setattr(scheduler, "_sleep_until_next_tick", lambda ts: None)
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: True)
+
+    # 4실패 + 1성공 + 4실패 = 9틱, 연속 5회를 채우는 구간이 없음
+    pattern = [False, False, False, False, True, False, False, False, False]
+    calls = {"n": 0}
+
+    def _pattern_tick(cfg, db, dex, eex, ts):
+        should_succeed = pattern[calls["n"]]
+        calls["n"] += 1
+        if not should_succeed:
+            raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(scheduler, "_tick", _pattern_tick)
+    liquidation_calls = []
+    monkeypatch.setattr(scheduler, "_execute_kill_switch_liquidation",
+                         lambda db, ex, count: liquidation_calls.append(count))
+
+    scheduler.run_live_loop({"mode": "testnet"}, db_path, max_iterations=len(pattern))
+
+    assert liquidation_calls == []  # 5연속을 채운 구간이 없으므로 발동 안 함
+    assert calls["n"] == len(pattern)  # 끝까지 정상적으로 돌았음(중도에 멈추지 않음)
+
+
+def test_execute_kill_switch_liquidation_closes_all_positions_both_strategies(db_path, monkeypatch):
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "2026-07-25T00:00:00Z", 2900.0)
+    save_position(db_path, "BTC/USDT:USDT", "2a", "short", 0.01, 60000.0, "2026-07-25T00:00:00Z", 78000.0)
+
+    exchange = _StubMarketOrderExchange(fill_price=100.0)
+    sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    scheduler._execute_kill_switch_liquidation(db_path, exchange, consecutive_errors=5)
+
+    assert load_open_positions(db_path) == []  # 양쪽 전략 모두 청산됨
+    closed_symbols = {c["symbol"] for c in exchange.calls}
+    assert closed_symbols == {"ETH/USDT:USDT", "BTC/USDT:USDT"}
+    assert len(sent) == 1
+    assert "5회" in sent[0]
+
+
+def test_execute_kill_switch_liquidation_reports_failed_closes_without_deleting_state(db_path, monkeypatch):
+    """★ 요구된 실패 케이스: 청산 주문마저 실패하면(이미 API가 불안정한
+    상황) 그 포지션은 state에서 지우지 않는다 - 공허한 성공 금지."""
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "2026-07-25T00:00:00Z", 2900.0)
+
+    exchange = _StubMarketOrderExchange(always_fail=True)
+    sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    scheduler._execute_kill_switch_liquidation(db_path, exchange, consecutive_errors=5)
+
+    remaining = load_open_positions(db_path)
+    assert len(remaining) == 1  # 청산 실패 - state 유지(방치와는 다름, 명시적으로 남겨서 사람이 보게 함)
+    assert len(sent) == 1
+    assert "ETH/USDT:USDT" in sent[0]  # 실패 목록에 포함돼 CRITICAL로 보고됨

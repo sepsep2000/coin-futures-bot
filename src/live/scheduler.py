@@ -70,7 +70,7 @@ from src.data.feed import cache_path, get_exchange, load_cache, update_funding_c
 from src.live import executor
 from src.live import state as live_state
 from src.notify import telegram
-from src.risk import can_open_new_position, daily_loss_limit_breached, position_size
+from src.risk import can_open_new_position, consecutive_error_kill_switch_triggered, daily_loss_limit_breached, position_size
 from src.strategy.regime import TREND, classify_regime
 from src.strategy.trend import generate_trend_signals, trailing_stop
 
@@ -79,6 +79,7 @@ from strategies.filtered_trend import MOMENTUM_LOOKBACK_DAYS, SYMBOL as FT_SYMBO
 
 CATASTROPHIC_STOP_PCT = 0.30  # 2a 백스톱 — 전략 파라미터 아님, 운영 안전망(모듈 docstring 참조)
 DATA_LOOKBACK_DAYS_15M = 30  # ATR/EMA/BB/chandelier 지표 워밍업에 충분한 여유(가장 긴 lookback: bb_width_percentile_window=120h=5일)
+CONSECUTIVE_ERROR_THRESHOLD = 5  # SPEC.md 2.4 "연속 5회 API 오류" 그대로(src/risk.py 기본값과 일치) — 임의 정의 아님
 
 
 def _log_stderr(message: str) -> None:
@@ -91,7 +92,20 @@ def run_live_loop(cfg: dict, db_path: Path, max_iterations: Optional[int] = None
     ★ max_iterations: 골격에 없던 파라미터(사전 보고, 최소 확장) — 무한
     루프를 자동 테스트/통합 테스트에서 유한 횟수로 끝내려면 필요하다.
     None(기본값)이면 무한 루프(실제 운영), 정수면 그 횟수만큼 틱을 처리한
-    뒤 정상 반환(테스트 전용)."""
+    뒤 정상 반환(테스트 전용).
+
+    ★ 연속오류 킬스위치(SPEC 2.4 "연속 5회 API 오류 시 전 포지션 청산 후
+    봇 정지", src/risk.py::consecutive_error_kill_switch_triggered):
+    "오류"로 세는 대상은 **틱 전체가 잡히지 않은 예외로 끝난 경우**만이다
+    (개별 주문 1건 실패는 executor.py가 이미 자체 3회 재시도+CRITICAL로
+    처리하고 예외를 던지지 않으므로 이 카운터에 안 잡힌다 — 그 경로는
+    일일손실한도/ensure_stop_placed 안전망이 이미 담당). 연속 카운터는
+    이 함수 스코프의 지역 변수(프로세스 재시작 시 자연히 0으로 초기화,
+    DB에 영속화하지 않음) — 발동하면 전 포지션(양쪽 전략) 청산 시도 후
+    `run_live_loop`가 즉시 반환해 루프를 멈춘다("봇 정지"는 프로세스
+    종료를 뜻함, 일일손실한도처럼 신규진입만 막고 계속 도는 게 아님).
+    재개는 사람이 원인을 확인하고 프로세스를 수동으로 재시작해야 한다 —
+    자동 재개 없음(카운터도 그때 자연히 리셋됨, 별도 리셋 로직 불필요)."""
     data_exchange = get_exchange(testnet=False)  # 신호용 시세는 항상 프로덕션(테스트넷 과거데이터는 합성값)
     exec_exchange = executor.get_authenticated_exchange(testnet=(cfg["mode"] == "testnet"))
     exec_exchange.load_markets()
@@ -107,16 +121,49 @@ def run_live_loop(cfg: dict, db_path: Path, max_iterations: Optional[int] = None
         )
 
     iteration = 0
+    consecutive_errors = 0
     while max_iterations is None or iteration < max_iterations:
         ts = pd.Timestamp.now(tz="UTC").floor("15min")
         try:
             _tick(cfg, db_path, data_exchange, exec_exchange, ts)
+            consecutive_errors = 0
         except Exception as exc:  # noqa: BLE001 - 한 틱의 예외로 루프 전체가 죽으면 안 됨(다음 틱에 재시도)
-            _log_stderr(f"_tick 실패({ts}): {type(exc).__name__}: {exc}")
-            telegram.send_critical_alert(f"틱 처리 중 예외 발생({ts}): {type(exc).__name__}: {exc}")
+            consecutive_errors += 1
+            _log_stderr(f"_tick 실패({ts}, 연속 {consecutive_errors}회): {type(exc).__name__}: {exc}")
+            telegram.send_critical_alert(
+                f"틱 처리 중 예외 발생({ts}, 연속 {consecutive_errors}회): {type(exc).__name__}: {exc}"
+            )
+            if consecutive_error_kill_switch_triggered(consecutive_errors, CONSECUTIVE_ERROR_THRESHOLD):
+                _execute_kill_switch_liquidation(db_path, exec_exchange, consecutive_errors)
+                return
         iteration += 1
         if max_iterations is None or iteration < max_iterations:
             _sleep_until_next_tick(ts)
+
+
+def _execute_kill_switch_liquidation(db_path: Path, exec_exchange, consecutive_errors: int) -> None:
+    """연속오류 킬스위치 발동 처리 — SPEC 2.4 그대로: 전 포지션(filtered_trend
+    + 2a 구분 없이 전부) 청산 시도 후 CRITICAL 발신. 청산 주문 자체가
+    실패해도(이미 API가 불안정한 상황이니 충분히 가능) executor.place_order가
+    예외를 던지지 않고 status="failed"를 반환하므로 이 함수는 안전하게
+    끝까지 순회한다 — 청산 성공/실패 목록을 전부 CRITICAL에 담아 사람이
+    무엇이 남았는지 즉시 알 수 있게 한다(방치 금지)."""
+    positions = live_state.load_open_positions(db_path)
+    liquidated: list[str] = []
+    failed: list[str] = []
+    for pos in positions:
+        close_direction = "short" if pos["direction"] == "long" else "long"
+        result = executor.place_order(exec_exchange, db_path, pos["symbol"], close_direction, pos["qty"])
+        if result.status == "filled":
+            live_state.delete_position(db_path, pos["symbol"], pos["strategy"])
+            liquidated.append(f"{pos['symbol']}({pos['strategy']})")
+        else:
+            failed.append(f"{pos['symbol']}({pos['strategy']})")
+
+    telegram.send_critical_alert(
+        f"연속오류 킬스위치 발동({consecutive_errors}회 연속 실패) - 봇 정지. "
+        f"청산 완료: {liquidated or '없음'}. 청산 실패(수동 확인 필요): {failed or '없음'}."
+    )
 
 
 def _sleep_until_next_tick(ts: pd.Timestamp) -> None:
