@@ -25,6 +25,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def resolve_db_path(cfg: dict, project_root: Optional[Path] = None) -> Path:
+    """config.yaml의 `db_path`(프로젝트 루트 기준 상대경로)를 절대경로로
+    해석한다 — DB 경로의 유일한 진실 소스(2026-07-25, G4_PREFLIGHT_CONFIG_
+    CHECK.md 확인 4에서 발견된 "확정된 경로가 없다"는 문제의 해소).
+    `src/live/runner.py`/`scripts/healthcheck.py` 둘 다 이 함수를 통해서만
+    db_path를 얻는다 — 개별 하드코딩 금지. 테스트는 이 함수를 거치지 않고
+    `tmp_path` 기반 경로를 직접 만들어 쓰므로 영향 없음(격리 유지)."""
+    project_root = project_root or Path(__file__).resolve().parent.parent.parent
+    return project_root / cfg["db_path"]
+
+
 @dataclass
 class ReconciliationResult:
     """recover_state()의 반환값 — DB 기록과 거래소 실제 상태의 대조 결과."""

@@ -231,7 +231,7 @@ def test_run_all_checks_check_raising_exception_counts_as_failure(db_path, monke
 
 def test_main_exit_code_zero_when_all_pass(db_path, monkeypatch):
     monkeypatch.setattr(hc, "_load_config", lambda: CFG)
-    monkeypatch.setattr(hc, "_resolve_db_path", lambda: db_path)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
     monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": True, "detail": "ok"}})
 
     assert hc.main() == 0
@@ -239,7 +239,7 @@ def test_main_exit_code_zero_when_all_pass(db_path, monkeypatch):
 
 def test_main_exit_code_one_and_sends_critical_alert_when_any_fails(db_path, monkeypatch):
     monkeypatch.setattr(hc, "_load_config", lambda: CFG)
-    monkeypatch.setattr(hc, "_resolve_db_path", lambda: db_path)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
     monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": False, "detail": "broken"}})
 
     sent = []
@@ -255,7 +255,7 @@ def test_main_does_not_crash_when_critical_alert_itself_fails(db_path, monkeypat
     수 있다 - 그래도 healthcheck.py 자체는 크래시하지 않고 exit 1로
     끝나야 한다(docstring에 명시된 한계, 조용히 죽으면 안 됨)."""
     monkeypatch.setattr(hc, "_load_config", lambda: CFG)
-    monkeypatch.setattr(hc, "_resolve_db_path", lambda: db_path)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
     monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"telegram_reachable": {"passed": False, "detail": "발신 실패"}})
     monkeypatch.setattr(hc.telegram, "send_critical_alert",
                          lambda msg: (_ for _ in ()).throw(ConnectionError("also down")))

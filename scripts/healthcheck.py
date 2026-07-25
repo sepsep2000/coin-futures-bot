@@ -57,7 +57,6 @@ from src.notify import telegram  # noqa: E402
 from strategies.filtered_trend import SYMBOL as FT_SYMBOL  # noqa: E402
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "live_state.db"
 
 TICK_INTERVAL_MINUTES = 15
 HEARTBEAT_STALE_MULTIPLE = 3  # 45분(15m x 3) - 근거: executor.py 재시도 백오프(최대 2+4+8=14초/주문) +
@@ -71,9 +70,15 @@ def _load_config() -> dict:
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-def _resolve_db_path() -> Path:
+def _resolve_db_path(cfg: dict) -> Path:
+    """★ 2026-07-25: DB 경로 자체 추정값(DEFAULT_DB_PATH)을 제거하고
+    config.yaml의 db_path를 유일한 진실 소스로 삼는다(src.live.state.
+    resolve_db_path() 재사용 — G4_PREFLIGHT_CONFIG_CHECK.md 확인 4에서
+    발견된 "확정된 경로가 없다" 문제의 해소). HEALTHCHECK_DB_PATH 환경변수는
+    테스트/운영 시 명시적 재정의용으로만 남겨둔다(기본값은 항상 config
+    기준)."""
     override = os.environ.get("HEALTHCHECK_DB_PATH")
-    return Path(override) if override else DEFAULT_DB_PATH
+    return Path(override) if override else live_state.resolve_db_path(cfg)
 
 
 def check_telegram_reachable() -> CheckResult:
@@ -178,7 +183,7 @@ def run_all_checks(cfg: dict, db_path: Path) -> dict:
 
 def main() -> int:
     cfg = _load_config()
-    db_path = _resolve_db_path()
+    db_path = _resolve_db_path(cfg)
 
     results = run_all_checks(cfg, db_path)
     state = {"ts": datetime.now(timezone.utc).isoformat(), "checks": results}

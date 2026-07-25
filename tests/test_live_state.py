@@ -13,6 +13,7 @@ from src.live.state import (
     load_open_positions,
     load_pending_orders,
     recover_state,
+    resolve_db_path,
     save_equity_snapshot,
     save_g4_start_timestamp,
     save_metadata,
@@ -240,3 +241,19 @@ def test_save_and_load_g4_start_timestamp_roundtrip(db_path):
     assert load_g4_start_timestamp(db_path) is None
     save_g4_start_timestamp(db_path, "2026-07-25T00:00:00+00:00")
     assert load_g4_start_timestamp(db_path) == "2026-07-25T00:00:00+00:00"
+
+
+# --- resolve_db_path (2026-07-25 추가 — DB 경로 단일 진실 소스) ---
+
+def test_resolve_db_path_joins_project_root_and_config_value():
+    project_root = Path("/fake/project/root")
+    cfg = {"db_path": "data/state.db"}
+    assert resolve_db_path(cfg, project_root) == project_root / "data" / "state.db"
+
+
+def test_resolve_db_path_defaults_to_real_project_root_when_omitted():
+    cfg = {"db_path": "data/state.db"}
+    result = resolve_db_path(cfg)
+    assert result.name == "state.db"
+    assert result.parent.name == "data"
+    assert result.is_absolute()
