@@ -10,16 +10,19 @@ LIVE_EXECUTION_ARCHITECTURE.md(설계) + `src/live/`·`src/notify/`·
 
 | 순위 | 작업 | 대상 파일 | 비고 |
 |---|---|---|---|
-| 1 | SQLite 스키마 구현 + `init_db`/`recover_state` | `src/live/state.py` | 다른 모든 작업의 전제(상태 없이는 주문도 알림도 의미 없음) |
-| 2 | 주문 실행(제출/폴링/취소) + 재시도 | `src/live/executor.py` | testnet 대상으로 먼저 구현·검증 |
-| 3 | `ensure_stop_placed` (최우선 복구 로직) | `src/live/executor.py` | CLAUDE.md가 "최우선"으로 못박은 항목 — 순위도 그에 맞게 앞쪽 |
-| 4 | 텔레그램 발신(기본 send_message + 특화 함수들) | `src/notify/telegram.py` | 봇 토큰 발급(2절, 사용자 작업)이 선행돼야 함 |
-| 5 | 스케줄러 메인 루프 + 두 전략 틱 처리 | `src/live/scheduler.py` | 1~4가 끝나야 조립 가능 |
+| 1 | ~~SQLite 스키마 구현 + `init_db`/`recover_state`~~ | `src/live/state.py` | **[2026-07-25 완료]** |
+| 2 | ~~주문 실행(제출/폴링/취소) + 재시도~~ | `src/live/executor.py` | **[2026-07-25 완료]** testnet 실측 검증(주문ID/체결가 확인) |
+| 3 | ~~`ensure_stop_placed` (최우선 복구 로직)~~ | `src/live/executor.py` | **[2026-07-25 완료]** 실측 중 발견한 버그(fetch_open_orders가 STOP_MARKET을 못 봄) 수정 완료 |
+| 4 | ~~텔레그램 발신(기본 send_message + 특화 함수들)~~ | `src/notify/telegram.py` | **[2026-07-25 완료]** 실제 수신 확인 |
+| 5 | ~~스케줄러 메인 루프 + 두 전략 틱 처리~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** 아래 "11" 항목의 스코프 축소 전제로 완료 — 완전한 백테스트-라이브 동등성은 아님 |
 | 6 | `/pause` `/resume` `/close_all` 명령 처리 + 인증 | `src/notify/telegram.py` | 설계 문서 6절 미결(인증 방식) 먼저 결정 |
-| 7 | `healthcheck.py` 5개 체크 실제 구현 | `scripts/healthcheck.py` | 1~4가 끝나야 각 체크 대상이 실존 |
+| 7 | `healthcheck.py` 5개 체크 실제 구현 | `scripts/healthcheck.py` | 1~4가 끝나야 각 체크 대상이 실존(이제 전제 충족, 착수 가능) |
 | 8 | 각 모듈 테스트 작성(정상/경계/실패 1건씩, CLAUDE.md 작업사이클) | `tests/test_live_*.py` | 구현과 함께 진행, 사후 추가 금지 |
-| 9 | 부분체결 재주문 정책 확정 + 구현 | `src/live/executor.py` | 설계 문서 6절 미결 사항 |
-| 10 | 2a 리밸런스 실행 순서(청산/신규 우선순위) 확정 + 구현 | `src/live/scheduler.py` | 설계 문서 6절 미결 사항 — 마진 여유 시뮬레이션 먼저 필요 |
+| 9 | 부분체결 재주문 정책 확정 + 구현 | `src/live/executor.py` | 설계 문서 6절 미결 사항. `handle_partial_fill()` 여전히 골격만 |
+| 10 | ~~2a 리밸런스 실행 순서(청산/신규 우선순위) 확정 + 구현~~ | `src/live/scheduler.py` | **[2026-07-25 완료]** reports/REBALANCE_ORDER_ANALYSIS.md 실측 계산, 청산 먼저 채택 |
+| **11** | **filtered_trend 라이브 부분익절/트레일링스탑/시간청산 구현** | `src/live/state.py`, `src/live/scheduler.py` | **[신규, 2026-07-25 발견]** 현재 라이브는 스탑로스 청산만 구현(과거 실측상 청산의 68.1%를 차지하는 다수 경로는 커버됨) — `_manage_trend_position`의 나머지 세 경로(부분익절/트레일링/시간청산)는 `positions` 테이블에 `initial_stop`/`bars_held`/`partial_taken`/`funding_paid_usd` 컬럼이 없어 재사용 불가. 스키마 확장 선행 필요. **G4(페이퍼 트레이딩) 착수 전 필수** — 이 간극이 남아있으면 라이브 동작이 백테스트가 검증한 것과 정확히 같지 않다. |
+| **12** | **ETH 심볼 충돌 근본 해결** | 설계 재검토 | **[신규, 2026-07-25 발견]** 2a 유니버스(20자산)에 ETH 포함 — filtered_trend과 격리마진 넷팅 충돌 위험. 임시완화책(2a 라이브에서 ETH 제외)만 적용됨(reports/REBALANCE_ORDER_ANALYSIS.md 4절). 헤지모드 전환 또는 심볼별 넷포지션 통합 회계 등 근본 해결은 미착수. |
+| **13** | **연속 오류 킬스위치(`consecutive_error_kill_switch_triggered`) 스케줄러 통합** | `src/live/scheduler.py` | **[신규, 2026-07-25 발견]** `src/risk.py`에 함수는 이미 있으나(연속 5회 API 오류 시 전 포지션 청산+봇 정지) 스케줄러 루프에 아직 연결 안 됨 — 이번 태스크는 일일 손실한도 킬스위치만 명시적으로 요청받아 그것만 구현. |
 
 ## 2. 사용자가 직접 해야 하는 작업 (코드로 대신할 수 없음)
 
