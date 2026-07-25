@@ -1,0 +1,13 @@
+,0
+n_trades,638
+step_a_overlap_pct,99.07391228376726
+step_b_n_clusters,283
+step_c_mean_r,0.7093032044649439
+step_c_mean_ci_lo,0.5837295976902602
+step_c_mean_ci_hi,0.8286689109608377
+step_c_pf,3.17438708151177
+step_d_corr_trend,0.8729487019842402
+multi_corr_vs_2a,-0.09751412792718331
+verdict,RECLASSIFY_AS_FILTER
+original_verdict,RECLASSIFY_AS_FILTER
+original_n_trades,633
