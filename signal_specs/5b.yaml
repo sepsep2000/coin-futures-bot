@@ -1,0 +1,10 @@
+# signal_specs/5b.yaml — 멀티호라이즌 횡단면 모멘텀(30일, 2a와 다른 lookback) (SIGNAL_CATALOG_V2.md)
+id: "5b"
+category: "cross_sectional_momentum"
+description: "횡단면 상대모멘텀(30일 lookback) — 2a와 동일 구조, 랭킹 lookback만 7일->30일로 교체"
+generator: "gen_2a"          # 2a와 완전히 동일한 로직 재사용 — 파라미터(lookback_days)만 다름
+regime_filter: null
+reference_signal: "trend"
+requires_net_neutral_check: true
+params:
+  lookback_days: 30           # 2a(7일)와 명확히 겹치지 않는 중기 모멘텀 구간, 스윕 없음

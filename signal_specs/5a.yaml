@@ -1,0 +1,9 @@
+# signal_specs/5a.yaml — 횡단면 캐리(펀딩비 상대 순위) (SIGNAL_CATALOG_V2.md)
+id: "5a"
+category: "cross_sectional_carry"
+description: "횡단면 캐리 — 20자산 펀딩비 상대순위, 저펀딩 롱/고펀딩 숏, 주간 리밸런스(가격+캐리 합산)"
+generator: "gen_5a"
+regime_filter: null          # 2a와 동일하게 단일자산 레짐 개념 없음 — STEP A 해당 없음
+reference_signal: "trend"
+requires_net_neutral_check: true
+params: {}

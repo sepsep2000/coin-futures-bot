@@ -244,7 +244,63 @@ def gen_2a(cfg: dict, params: dict) -> dict:
             "daily_net_exposure": daily_net_exposure, "daily_close_for_btc": daily["BTC"]}
 
 
-GENERATORS = {"gen_1a": gen_1a, "gen_2a": gen_2a, "gen_4a": gen_4a, "gen_4b": gen_4b}
+def gen_5a(cfg: dict, params: dict) -> dict:
+    """5a — 횡단면 캐리(펀딩비 상대 순위). SIGNAL_CATALOG_V2.md 5a 명세.
+    2a와 동일한 20자산·4분위·주간 리밸런스 구조를 재사용(신규 구조 발명 없음),
+    랭킹 기준만 모멘텀 대신 "현재" 펀딩비 스냅샷으로 교체. 수익 = 가격
+    스프레드(2a와 동일 계산) + 캐리(숏그룹 펀딩합 평균 - 롱그룹 펀딩합 평균,
+    숏그룹이 펀딩비 높은 쪽이라 구조적으로 양(+))."""
+    with open(PROJECT_ROOT / "config" / "tickers.txt", encoding="utf-8") as f:
+        tickers = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+
+    closes, funding_raw = {}, {}
+    for pair in tickers:
+        d = load_symbol_data(symbol_file(pair))
+        base = pair.split("/")[0]
+        closes[base] = d.df_15m["close"].resample("1D").last()
+        fdf = d.funding.copy()
+        fdf["ts"] = pd.to_datetime(fdf["timestamp"], unit="ms", utc=True)
+        funding_raw[base] = fdf.set_index("ts")["funding_rate"].sort_index()
+
+    daily_close = pd.DataFrame(closes).dropna()
+    weekly_closes = daily_close.resample("W").last()
+    weekly_dates = weekly_closes.index
+
+    rows = []
+    for i in range(len(weekly_dates) - 1):
+        reb_date, exit_date = weekly_dates[i], weekly_dates[i + 1]
+        snapshot = {b: s.asof(reb_date) for b, s in funding_raw.items()}
+        snapshot = pd.Series(snapshot).dropna()
+        if len(snapshot) < 8:
+            continue
+        ranked = snapshot.sort_values()
+        k = max(1, len(ranked) // 4)
+        long_group, short_group = ranked.index[:k], ranked.index[-k:]
+
+        next_week_price_ret = weekly_closes.iloc[i + 1] / weekly_closes.iloc[i] - 1
+        price_component = float(next_week_price_ret[long_group].mean() - next_week_price_ret[short_group].mean())
+
+        funding_sum = {}
+        for b in list(long_group) + list(short_group):
+            s = funding_raw[b]
+            funding_sum[b] = float(s[(s.index > reb_date) & (s.index <= exit_date)].sum())
+        funding_sum = pd.Series(funding_sum)
+        carry_component = float(funding_sum[short_group].mean() - funding_sum[long_group].mean())
+
+        rows.append({
+            "entry_time": reb_date, "exit_time": exit_date, "direction": "market_neutral",
+            "return": price_component + carry_component, "price_component": price_component,
+            "carry_component": carry_component, "n_top": len(long_group), "n_bottom": len(short_group),
+        })
+
+    trades_df = pd.DataFrame(rows)
+    daily_net_exposure = pd.Series(0.0, index=daily_close.index)
+
+    return {"trades_df": trades_df, "bar_index": None, "n_bars": None, "reference_windows": None,
+            "daily_net_exposure": daily_net_exposure, "daily_close_for_btc": daily_close["BTC"]}
+
+
+GENERATORS = {"gen_1a": gen_1a, "gen_2a": gen_2a, "gen_4a": gen_4a, "gen_4b": gen_4b, "gen_5a": gen_5a}
 
 
 # ---------------------------------------------------------------------------
