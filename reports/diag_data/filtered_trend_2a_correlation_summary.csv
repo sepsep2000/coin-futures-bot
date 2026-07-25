@@ -1,0 +1,11 @@
+,0
+trend_filtered_1a_total_active_days,112.75
+2a_total_active_days,1295.0
+overlap_days,112.75
+overlap_pct_of_trend_filtered_1a,100.0
+overlap_pct_of_2a,8.706563706563706
+weekly_return_correlation,-0.09856381301174537
+n_weeks_compared,185
+is_independent,True
+reference_unfiltered_trend_total_active_days,179.47916666666666
+reference_unfiltered_trend_overlap_pct_with_2a,100.0

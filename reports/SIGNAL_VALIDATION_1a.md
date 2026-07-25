@@ -20,4 +20,9 @@
 ## STEP D. 기존 trend 신호와의 상관관계
 - 비교 주수 185, 주간수익률 상관계수 0.8762 — 독립(<0.3): False
 
+## STEP D 확장. 기존 PASS/ACCEPT 신호들과의 상관관계 (accepted_signals.yaml)
+- vs 2a: 상관계수 -0.0986 (비교 주수 185) — 독립(<0.3): True
+- vs trend_filtered_1a: 상관계수 1.0000 (비교 주수 184) — 독립(<0.3): False
+- 중복 플래그: ['trend_filtered_1a']
+
 ## 최종 판정: **RECLASSIFY_AS_FILTER**
