@@ -124,6 +124,15 @@
 - 진입 주문 체결 확인 → **즉시** STOP_MARKET(reduceOnly) 배치. 배치 실패 시 포지션 시장가 청산 + 텔레그램 CRITICAL 알림
 - 스탑 주문 존재 여부를 매 루프마다 검증(포지션 있는데 스탑 없으면 재배치)
 - 연속 5회 API 오류 시 전 포지션 청산 후 봇 정지
+- **자본배분/리스크사이징 기준**: `fetch_balance()["total"]["USDT"]` 단일자산
+  잔고 사용(`src/live/scheduler.py::_fetch_total_equity_usd()`, `equity_snapshots`
+  테이블도 이 값을 그대로 기록). BTC/USDC 등 계좌 내 타 자산은 자본 계산에서
+  제외됨. 사유: 실측 확인 결과(2026-07-26) 테스트넷 계좌의 Multi-Assets Mode가
+  꺼져 있음(`fapiPrivateGetMultiAssetsMargin()` → `multiAssetsMargin: false`) —
+  이 모드가 꺼진 USDT-M 선물 계좌에서는 USDT만 증거금으로 기능하고 BTC/USDC는
+  증거금으로 쓰이지 않는 단순 잔여 보유분이므로, USDT 단일잔고 기준이 실제
+  가용 증거금과 정확히 일치한다(과소평가 아님). Multi-Assets Mode를 이후 켜는
+  경우 이 결정은 재검토 필요. 결정일: 2026-07-26
 
 ## 3. 아키텍처 (하네스 구조)
 
