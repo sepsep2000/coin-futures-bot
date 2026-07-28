@@ -35,13 +35,60 @@ parquet 푸터가 잘린 손상 파일이 남고 이후 영구히 복구 안 되
 **데이터 복구**: 손상된 `ETHUSDT-USDT_15m.parquet` 삭제 후 live 엔드포인트에서
 재수집 — 125,233행, 결측 캔들 0건, 2023-01-01~현재 정상 재구성 확인.
 
-**미해결**:
+**미해결(당시 시점)**:
 - crontab watchdog은 여전히 비활성화 상태로 유지함(재발 방지 검증 후 사용자
   승인 하에 재활성화 필요 — 임의로 켜지 않음).
 - 어제(07-27) 킬스위치 사고 대응 코드(`scheduler.py` reduceOnly/실측기준 청산/
   None가드, `daily_report.py`)는 이번 커밋에 함께 반영.
 - 원격(`origin/main`)에 77개+ 커밋 미푸시 상태 — 백업 목적 push는 사용자 승인
   대기 중.
+
+## 2026-07-28 (이어서) — crontab 재활성화 중 WSL↔Windows 인터롭 실행 불안정 발견 → WSL 내부 완결형 실행 구조로 전환
+
+**원격 push**: 위 5개 커밋 전부 `origin/main`에 반영 완료(`git log origin/main`
+으로 확인).
+
+**crontab 재활성화 1차 시도 → 실패, 새 문제 발견**: 비활성화 주석 제거 후
+`run_cycle.sh` 수동 실행(PID 386) → **15분 넘게 CPU 시간 0초, heartbeat 갱신
+0회, 파일 변화 0건** — 첫 틱(계좌 조회 이전 단계)조차 진행 안 됨. 같은 시작
+시퀀스(`get_exchange`→`load_markets`→`recover_state`)를 **Windows에서 직접
+실행**하면 5.1초에 정상 완료 — 파케이 버그와 무관한 별개 문제로 확인, 프로세스
+kill + crontab 재비활성화(임의 재시도 안 함, 안전 상태로 롤백).
+
+**`wsl --shutdown` 후 재검증 → 증상 악화(즉시 재현), 근본원인 특정**:
+재기동 후 동일 절차로 재시도 → 이번엔 프로세스가 24초 만에 사망, `runner.log`에
+`.venv/Scripts/python.exe: 1: MZ...` — **WSL이 Windows PE 실행파일(.exe)을
+인터롭으로 넘기지 못하고 바이너리 내용을 셸 스크립트로 직접 실행하려다 깨짐**
+(binfmt_misc 인터롭 핸들러가 그 시점에 준비 안 된 것으로 추정). 재현성 없이
+매번 다르게 실패 — "WSL cron이 nohup으로 Windows 네이티브 python.exe를
+백그라운드 실행"하는 구조 자체가 이 환경에서 신뢰할 수 없다고 판정, 재시도
+대신 구조 전환 결정.
+
+**구조 전환**: WSL(Ubuntu 22.04) 내부에 독립 Python 3.10 venv(`.venv-wsl`,
+Windows용 기존 `.venv`와 별개) 신설, `requirements.txt` 전체 재설치
+(ccxt 4.5.69/pandas 2.3.3/numpy 2.2.6/pyarrow 25.0.0 등). `tests/ -x -q`
+299/299 통과(WSL 파이썬에서도 재확인). 거래소 접근성(`fetch_balance`/
+`fetch_positions`) 3.3초 내 정상 확인. [scripts/run_cycle.sh](scripts/run_cycle.sh)
+의 인터프리터 탐색 우선순위를 `.venv-wsl/bin/python` 최우선으로 변경, crontab의
+`healthcheck.py`/`daily_report.py` 호출도 같은 경로로 교체 — Windows 실행파일
+경계 자체를 없애 이 클래스의 실패가 구조적으로 불가능해짐.
+
+**검증 결과**:
+- 수동 실행(PID 383): 시작 13:42:27 → 첫 틱 완료 13:42:41 (14초), CPU 시간 정상 증가, "MZ" 에러 재현 안 됨
+- crontab 경유 재기동(PID 521): cron이 13:45:01에 자동 시작 → 13:45:15 첫 틱 완료(14초) — 사람 개입 없이 정상 동작 확인
+- healthcheck.py(13:45:16 실행): telegram_reachable/heartbeat_fresh/exchange_reachable/state_matches_exchange/disk_and_db_accessible **5개 항목 전부 PASS** (heartbeat_fresh: "마지막 틱 0:02:31 전 - 정상")
+- 매 단계 전후 거래소 실측(`fetch_positions`/`fetch_open_orders`) 재확인 — 전 과정에서 포지션 0건, 미체결주문 0건, USDT 잔고 $5,160.11 유지(우발적 주문 없음)
+
+**텔레그램 "정상 재개" 알림 발송 완료**(위 검증 전부 통과 후).
+
+**미해결**:
+- 기존 `.venv`(Windows)는 남겨둠 — 로컬에서 Windows 파이썬으로 직접 스크립트를
+  돌릴 때(진단/조사용) 계속 씀. 운영(cron)은 이제 `.venv-wsl`만 사용.
+  둘을 동시에 유지보수해야 하는 부담은 생김(향후 Windows 쪽을 완전히 걷어낼지는
+  별도 논의 필요).
+- WSL binfmt 인터롭이 정확히 "왜" 재부팅 직후 불안정한지(레이스 컨디션의 정확한
+  트리거)는 규명하지 않음 — 구조 전환으로 그 원인 자체를 우회했으므로 추가 조사
+  불필요 판단.
 
 ## 2026-07-24 — Phase 0: 스캐폴딩 + 데이터 파이프라인
 
