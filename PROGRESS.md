@@ -1,5 +1,48 @@
 # PROGRESS.md
 
+## 2026-07-28 — 클로드 코드 세션 유실 후 전면 재점검 + 파케이 캐시 손상 사고 대응
+
+**배경**: 로컬 클로드 코드 앱이 강제종료되어 이전 세션 컨텍스트 유실. 재점검 결과
+파일/커밋 자체는 전혀 유실되지 않았음(디스크와 세션 컨텍스트는 별개) — 다만
+원격에 push 안 된 커밋 77개 + 미커밋 WIP 5개 파일이 로컬에만 있던 상태였음.
+
+**조사 결과 (코드 변경 없이 순수 조사)**
+- 봇 프로세스는 WSL crontab(`run_cycle.sh`, 15분마다, nohup+PID파일)으로 클로드 코드
+  앱과 완전히 분리되어 독립 실행되는 구조가 맞음을 확인 — 크래시가 봇에 전파된
+  증거 없음.
+- crontab에서 `run_cycle.sh` 줄이 `# [2026-07-27T21:40Z EMERGENCY STOP - disabled
+  pending parquet corruption root-cause fix]`로 **의도적으로 비활성화**되어 있었음
+  (이전 세션이 아래 버그를 진단하고 재발 방지로 watchdog을 직접 끈 것으로 판단).
+- 근본원인: `data/ohlcv/ETHUSDT-USDT_15m.parquet`가 실제로 손상되어 있었음(직접
+  로드 재현: `OSError: Couldn't deserialize thrift`). 07-27 14:30~21:30 UTC 매 틱
+  실패 → healthcheck가 15분마다 CRITICAL 텔레그램 발송(58건 누적, 사용자가 받은
+  알림 폭주의 원인) → 21:40 watchdog 비활성화로 정지.
+- 거래소 실측 재조회(`fetch_positions`/`fetch_open_orders`) 결과 열린 포지션·미체결
+  주문 0건, DB와 일치 — 위험 노출 없음 확인. 잔고 $5,160.11 USDT.
+- 이 사고는 `reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md`(07-27 킬스위치 사고)와는
+  별개(그 사고의 수동 청산 이후 13:45 UTC 재진입한 ETH 롱의 스탑 배치가
+  `OrderImmediatelyFillable`로 반복 실패한 것이 계기 — 이 포지션은 현재 거래소에
+  없어 이후 정상 청산된 것으로 판단, 재구성 근거는 `orders` 테이블 타임스탬프).
+
+**수정**: [src/data/feed.py](src/data/feed.py) `save_cache()`가 캐시 경로에 직접
+`to_parquet`을 호출해서, 쓰기 도중 프로세스가 중단되면(강제종료/슬립/재시작 등)
+parquet 푸터가 잘린 손상 파일이 남고 이후 영구히 복구 안 되는 구조적 결함이었음
+— `.tmp` 파일에 먼저 쓰고 `Path.replace()`로 원자적 교체하도록 수정(쓰기 실패 시
+기존 파일은 항상 이전 정상 상태 그대로 유지됨). 신규 테스트 2개(경계: 성공 후
+임시파일 잔존 안 함, 실패: 쓰기 중 예외 발생해도 기존 캐시 손상 안 됨 — 사고
+재현 회귀 테스트). `tests/ -x -q` 299/299 통과(기존 297 + 신규 2).
+
+**데이터 복구**: 손상된 `ETHUSDT-USDT_15m.parquet` 삭제 후 live 엔드포인트에서
+재수집 — 125,233행, 결측 캔들 0건, 2023-01-01~현재 정상 재구성 확인.
+
+**미해결**:
+- crontab watchdog은 여전히 비활성화 상태로 유지함(재발 방지 검증 후 사용자
+  승인 하에 재활성화 필요 — 임의로 켜지 않음).
+- 어제(07-27) 킬스위치 사고 대응 코드(`scheduler.py` reduceOnly/실측기준 청산/
+  None가드, `daily_report.py`)는 이번 커밋에 함께 반영.
+- 원격(`origin/main`)에 77개+ 커밋 미푸시 상태 — 백업 목적 push는 사용자 승인
+  대기 중.
+
 ## 2026-07-24 — Phase 0: 스캐폴딩 + 데이터 파이프라인
 
 **변경**
