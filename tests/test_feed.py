@@ -113,6 +113,39 @@ def test_load_cache_returns_none_when_missing(tmp_path):
     assert load_cache(tmp_path / "does_not_exist.parquet") is None
 
 
+def test_save_cache_leaves_no_temp_file_after_success(tmp_path):
+    """경계: 정상 저장 후 임시파일(.parquet.tmp)이 남지 않아야 한다 —
+    남으면 디스크에 잔여 쓰레기가 쌓이고, os.replace가 실제로 호출됐는지의
+    증거이기도 하다."""
+    path = cache_path(tmp_path, "BTC/USDT:USDT", "15m")
+    save_cache(ohlcv_rows_to_df([_ohlcv_row(0)]), path)
+    assert path.exists()
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_save_cache_failure_does_not_corrupt_existing_cache(tmp_path, monkeypatch):
+    """실패: 2026-07-27 사고 재현 방지 회귀 테스트. 쓰기 도중(to_parquet) 예외가
+    나도 기존 캐시 파일은 손상되지 않고 그대로 읽혀야 한다 — 이전 구현은
+    `path`에 직접 썼기 때문에 중간에 끊기면 parquet 푸터가 잘린 손상 파일이
+    남았다(실측: data/ohlcv/ETHUSDT-USDT_15m.parquet, OSError:
+    Couldn't deserialize thrift 재현됨). 임시파일에 먼저 쓰고 성공했을 때만
+    교체하면 이 실패 모드 자체가 불가능해진다."""
+    path = cache_path(tmp_path, "BTC/USDT:USDT", "15m")
+    original = ohlcv_rows_to_df([_ohlcv_row(0), _ohlcv_row(INTERVAL_15M)])
+    save_cache(original, path)
+
+    def _boom(self, *args, **kwargs):
+        raise OSError("simulated interrupted write")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", _boom)
+    with pytest.raises(OSError):
+        save_cache(ohlcv_rows_to_df([_ohlcv_row(2 * INTERVAL_15M)]), path)
+
+    monkeypatch.undo()
+    reloaded = load_cache(path)  # 손상 없이 실패 이전 값 그대로여야 함
+    pd.testing.assert_frame_equal(reloaded, original)
+
+
 # --- 페이지네이션 (fake exchange, 네트워크 없음) ---
 
 class _FakeExchange:

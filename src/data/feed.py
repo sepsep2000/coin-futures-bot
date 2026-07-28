@@ -116,8 +116,16 @@ def load_cache(path: Path) -> Optional[pd.DataFrame]:
 
 
 def save_cache(df: pd.DataFrame, path: Path) -> None:
+    """★ 2026-07-28 사고 대응: 임시파일에 쓴 뒤 원자적으로 교체한다 — 기존에는
+    `path`에 직접 `to_parquet`을 호출해서, 쓰기 도중 프로세스가 중단되면(강제종료,
+    슬립, 재시작 등) 파일 끝의 parquet 푸터가 잘려 손상된 채로 남았다(실측:
+    data/ohlcv/ETHUSDT-USDT_15m.parquet가 이 방식으로 손상되어 라이브 틱이 2026-07-27
+    14:30부터 7시간 넘게 매번 실패, 결국 watchdog까지 정지됨). 쓰기가 중간에 실패해도
+    `path`는 항상 이전(정상) 상태 아니면 새(정상) 상태 둘 중 하나만 갖는다."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp_path, index=False)
+    tmp_path.replace(path)
 
 
 # ---------------------------------------------------------------------------
