@@ -79,6 +79,29 @@ def send_message(text: str, chat_id: Optional[str] = None) -> bool:
         return False
 
 
+def check_reachable() -> bool:
+    """★ 2026-07-29 알림 피로 방지: healthcheck.py가 15분마다 텔레그램
+    연결을 확인하는데, 예전엔 그때마다 send_message()로 실제 채팅
+    메시지("텔레그램 발신 정상 확인")를 보내서 하루 96번씩 무의미한
+    알림이 쌓였다(사용자 피드백: 알림이 너무 자주 옴). get_me()는 토큰이
+    유효하고 텔레그램 API에 네트워크로 도달 가능한지만 확인하고 채팅
+    메시지는 전혀 보내지 않는다 - chat_id 설정 자체는 여전히 확인한다
+    (get_me가 안 쓰더라도, "알림을 보낼 준비가 됐는지"의 일부이므로)."""
+    try:
+        token, _ = _get_credentials()
+    except RuntimeError as exc:
+        _log_stderr(f"check_reachable 실패(자격증명): {exc}")
+        return False
+
+    try:
+        bot = Bot(token=token)
+        asyncio.run(bot.get_me())
+        return True
+    except Exception as exc:  # noqa: BLE001 - send_message과 동일한 격리 원칙
+        _log_stderr(f"check_reachable 실패: {type(exc).__name__}: {exc}")
+        return False
+
+
 def send_critical_alert(message: str) -> bool:
     """SPEC 5절 CRITICAL: 스탑 배치 실패, API 연속 오류, 킬스위치 발동,
     프로세스 재시작, 상태 불일치(recover_state 결과) 등. 즉시 발신,

@@ -63,6 +63,9 @@ HEARTBEAT_STALE_MULTIPLE = 3  # 45분(15m x 3) - 근거: executor.py 재시도 �
 # 2a 리밸런스처럼 무거운 틱 1회를 넉넉히 흡수하고도, 조용히 멈춘 프로세스를 1시간 안에는 잡아내기 위한 여유값
 MIN_FREE_DISK_MB = 500  # 이 프로젝트의 SQLite DB/로그는 수십MB 규모라 500MB면 충분히 보수적인 하한
 
+ALERT_STATE_PATH = PROJECT_ROOT / "logs" / "healthcheck_alert_state.json"
+ALERT_REMINDER_INTERVAL = timedelta(hours=2)  # 같은 실패가 계속되는 동안 이 주기로만 재알림
+
 CheckResult = tuple[bool, str]
 
 
@@ -82,9 +85,12 @@ def _resolve_db_path(cfg: dict) -> Path:
 
 
 def check_telegram_reachable() -> CheckResult:
-    ok = telegram.send_message("[HEALTHCHECK] 텔레그램 발신 정상 확인")
+    """★ 2026-07-29: send_message 대신 telegram.check_reachable()(get_me만
+    호출, 채팅 메시지 미발신)을 쓴다 - 이전엔 이 체크가 15분마다 실제
+    확인 메시지를 보내서 하루 96번씩 알림 피로를 유발했다(사용자 피드백)."""
+    ok = telegram.check_reachable()
     if ok:
-        return True, "텔레그램 발신 성공"
+        return True, "텔레그램 API 연결 확인(get_me) 성공 - 채팅 메시지는 보내지 않음"
     return False, "텔레그램 발신 실패 - 토큰/chat_id 또는 네트워크 확인 필요"
 
 
@@ -181,6 +187,37 @@ def run_all_checks(cfg: dict, db_path: Path) -> dict:
     return results
 
 
+def _load_alert_state(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 상태파일이 깨져있으면 "새 실패"로 취급(안전 쪽 fallback)
+        return None
+
+
+def _save_alert_state(path: Path, state: Optional[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if state is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+
+def _should_send_failure_alert(prev_state: Optional[dict], signature: str, now: datetime) -> bool:
+    """★ 알림 피로 방지(2026-07-29, 사용자 피드백): 같은 실패가 지속되는
+    동안 15분마다 거의 동일한 CRITICAL을 반복 발신하던 것을 억제한다
+    (실측: 파케이 손상 사고 때 7시간 동안 58건 발신). 새 실패(직전과 다른
+    항목 집합)는 즉시 알리고, 같은 실패가 지속되면 ALERT_REMINDER_INTERVAL
+    마다만 재알림한다. dedup 키는 detail 텍스트가 아니라 실패 항목 이름의
+    집합이다 - heartbeat_fresh의 detail은 경과시간이 매 실행마다 바뀌어서
+    텍스트 기준으로는 "같은 실패"가 절대 안 잡히기 때문."""
+    if prev_state is None or prev_state.get("signature") != signature:
+        return True
+    last_alert = datetime.fromisoformat(prev_state["last_alert_ts"])
+    return now - last_alert >= ALERT_REMINDER_INTERVAL
+
+
 def main() -> int:
     cfg = _load_config()
     db_path = _resolve_db_path(cfg)
@@ -190,16 +227,23 @@ def main() -> int:
     print(json.dumps(state, ensure_ascii=False, indent=2))
 
     failures = {k: v["detail"] for k, v in results.items() if not v["passed"]}
-    if failures:
-        summary = "; ".join(f"{k}: {v}" for k, v in failures.items())
-        print(f"[HEALTHCHECK] FAIL: {summary}", file=sys.stderr)
+    if not failures:
+        _save_alert_state(ALERT_STATE_PATH, None)  # 회복 시 초기화 - 다음 실패는 새 실패로 즉시 재알림
+        return 0
+
+    summary = "; ".join(f"{k}: {v}" for k, v in failures.items())
+    print(f"[HEALTHCHECK] FAIL: {summary}", file=sys.stderr)
+
+    signature = ",".join(sorted(failures.keys()))
+    now = datetime.now(timezone.utc)
+    prev_state = _load_alert_state(ALERT_STATE_PATH)
+    if _should_send_failure_alert(prev_state, signature, now):
         try:
             telegram.send_critical_alert(f"헬스체크 실패: {summary}")
         except Exception:  # noqa: BLE001 - telegram_reachable 자체가 실패 원인이면 이 시도도 실패할 수 있음(예상된 한계, 위 docstring 참조)
             pass
-        return 1
-
-    return 0
+        _save_alert_state(ALERT_STATE_PATH, {"signature": signature, "last_alert_ts": now.isoformat()})
+    return 1
 
 
 if __name__ == "__main__":

@@ -12,25 +12,33 @@ from src.notify import telegram
 
 
 class _FakeBotInstance:
-    def __init__(self, calls: list, raise_exc: Exception | None = None):
+    def __init__(self, calls: list, raise_exc: Exception | None = None, get_me_calls: list | None = None):
         self._calls = calls
         self._raise_exc = raise_exc
+        self._get_me_calls = get_me_calls
 
     async def send_message(self, chat_id, text):
         if self._raise_exc is not None:
             raise self._raise_exc
         self._calls.append({"chat_id": chat_id, "text": text})
 
+    async def get_me(self):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        if self._get_me_calls is not None:
+            self._get_me_calls.append(True)
+
 
 class _FakeBotFactory:
-    def __init__(self, calls: list, raise_exc: Exception | None = None):
+    def __init__(self, calls: list, raise_exc: Exception | None = None, get_me_calls: list | None = None):
         self.calls = calls
         self.raise_exc = raise_exc
+        self.get_me_calls = get_me_calls
         self.constructed_with_token: list[str] = []
 
     def __call__(self, token):
         self.constructed_with_token.append(token)
-        return _FakeBotInstance(self.calls, self.raise_exc)
+        return _FakeBotInstance(self.calls, self.raise_exc, self.get_me_calls)
 
 
 @pytest.fixture
@@ -110,6 +118,46 @@ def test_send_message_failure_does_not_leak_token_in_logs(env_credentials, monke
     captured = capsys.readouterr()
     assert "fake-token-123" not in captured.out
     assert "fake-token-123" not in captured.err
+
+
+# =====================================================================
+# check_reachable — 2026-07-29 추가(알림 피로 방지: healthcheck가 15분마다
+# 부르는데 send_message는 실제 채팅 메시지를 보내 하루 96번씩 쌓였다)
+# =====================================================================
+
+def test_check_reachable_success_calls_get_me_not_send_message(env_credentials, monkeypatch):
+    """정상: get_me만 호출하고 send_message용 채팅 메시지는 전혀 안 보낸다."""
+    calls: list = []
+    get_me_calls: list = []
+    monkeypatch.setattr(telegram, "Bot", _FakeBotFactory(calls, get_me_calls=get_me_calls))
+
+    result = telegram.check_reachable()
+
+    assert result is True
+    assert get_me_calls == [True]
+    assert calls == []  # send_message 경로 미사용
+
+
+def test_check_reachable_missing_credentials_returns_false_not_raise(monkeypatch, tmp_path):
+    """경계: 자격증명 누락 시 예외 대신 False(다른 CLAUDE.md 격리 원칙과 동일)."""
+    empty_env = tmp_path / ".env"
+    empty_env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(telegram, "ENV_PATH", empty_env)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    assert telegram.check_reachable() is False
+
+
+def test_check_reachable_network_error_is_isolated_returns_false(env_credentials, monkeypatch, capsys):
+    """실패: get_me가 던지는 예외가 호출부로 전파되면 안 된다(격리)."""
+    monkeypatch.setattr(telegram, "Bot", _FakeBotFactory([], raise_exc=ConnectionError("network down")))
+
+    result = telegram.check_reachable()
+
+    assert result is False
+    captured = capsys.readouterr()
+    assert "network down" in captured.err
 
 
 # =====================================================================

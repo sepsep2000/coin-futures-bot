@@ -32,16 +32,29 @@ def db_path(tmp_path) -> Path:
 # =====================================================================
 
 def test_check_telegram_reachable_success(monkeypatch):
-    monkeypatch.setattr(hc.telegram, "send_message", lambda text: True)
+    monkeypatch.setattr(hc.telegram, "check_reachable", lambda: True)
     passed, detail = hc.check_telegram_reachable()
     assert passed is True
 
 
 def test_check_telegram_reachable_failure(monkeypatch):
-    monkeypatch.setattr(hc.telegram, "send_message", lambda text: False)
+    monkeypatch.setattr(hc.telegram, "check_reachable", lambda: False)
     passed, detail = hc.check_telegram_reachable()
     assert passed is False
     assert "발신 실패" in detail
+
+
+def test_check_telegram_reachable_does_not_send_chat_message(monkeypatch):
+    """★ 2026-07-29 회귀 테스트: 이 체크가 실제 채팅 메시지(send_message)를
+    호출하면 안 된다 - 15분마다 무의미한 확인 메시지가 쌓이던 문제(사용자
+    피드백)의 재발 방지."""
+    calls: list = []
+    monkeypatch.setattr(hc.telegram, "send_message", lambda text, chat_id=None: calls.append(text) or True)
+    monkeypatch.setattr(hc.telegram, "check_reachable", lambda: True)
+
+    hc.check_telegram_reachable()
+
+    assert calls == []
 
 
 # =====================================================================
@@ -229,18 +242,20 @@ def test_run_all_checks_check_raising_exception_counts_as_failure(db_path, monke
     assert "예외" in results["buggy_check"]["detail"]
 
 
-def test_main_exit_code_zero_when_all_pass(db_path, monkeypatch):
+def test_main_exit_code_zero_when_all_pass(db_path, tmp_path, monkeypatch):
     monkeypatch.setattr(hc, "_load_config", lambda: CFG)
     monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
     monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": True, "detail": "ok"}})
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", tmp_path / "alert_state.json")
 
     assert hc.main() == 0
 
 
-def test_main_exit_code_one_and_sends_critical_alert_when_any_fails(db_path, monkeypatch):
+def test_main_exit_code_one_and_sends_critical_alert_when_any_fails(db_path, tmp_path, monkeypatch):
     monkeypatch.setattr(hc, "_load_config", lambda: CFG)
     monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
     monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": False, "detail": "broken"}})
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", tmp_path / "alert_state.json")
 
     sent = []
     monkeypatch.setattr(hc.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
@@ -250,14 +265,118 @@ def test_main_exit_code_one_and_sends_critical_alert_when_any_fails(db_path, mon
     assert "broken" in sent[0]
 
 
-def test_main_does_not_crash_when_critical_alert_itself_fails(db_path, monkeypatch):
+def test_main_does_not_crash_when_critical_alert_itself_fails(db_path, tmp_path, monkeypatch):
     """★ telegram_reachable 자체가 실패 원인이면 실패 보고 시도도 실패할
     수 있다 - 그래도 healthcheck.py 자체는 크래시하지 않고 exit 1로
     끝나야 한다(docstring에 명시된 한계, 조용히 죽으면 안 됨)."""
     monkeypatch.setattr(hc, "_load_config", lambda: CFG)
     monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
     monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"telegram_reachable": {"passed": False, "detail": "발신 실패"}})
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", tmp_path / "alert_state.json")
     monkeypatch.setattr(hc.telegram, "send_critical_alert",
                          lambda msg: (_ for _ in ()).throw(ConnectionError("also down")))
 
     assert hc.main() == 1
+
+
+# =====================================================================
+# 알림 피로 방지 — 같은 실패 반복 시 dedup (2026-07-29, 사용자 피드백:
+# "텔레그램 알림 너무 자주 옴, 쓸데없는거 안오게 해")
+# =====================================================================
+
+def test_should_send_failure_alert_true_when_no_previous_state():
+    """정상: 이전 상태가 없으면(첫 실패) 무조건 즉시 알린다."""
+    assert hc._should_send_failure_alert(None, "a", datetime.now(timezone.utc)) is True
+
+
+def test_should_send_failure_alert_false_within_reminder_interval():
+    """경계: 같은 실패가 REMINDER_INTERVAL 이내에 반복되면 재알림 안 함."""
+    now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
+    prev = {"signature": "a,b", "last_alert_ts": (now - timedelta(minutes=30)).isoformat()}
+    assert hc._should_send_failure_alert(prev, "a,b", now) is False
+
+
+def test_should_send_failure_alert_true_after_reminder_interval_elapses():
+    """실패(지속 상황): REMINDER_INTERVAL을 넘기면 그때는 다시 알린다."""
+    now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
+    prev = {"signature": "a,b", "last_alert_ts": (now - hc.ALERT_REMINDER_INTERVAL - timedelta(minutes=1)).isoformat()}
+    assert hc._should_send_failure_alert(prev, "a,b", now) is True
+
+
+def test_main_dedupes_repeated_identical_failure_within_reminder_interval(db_path, tmp_path, monkeypatch):
+    """★ 회귀 테스트: 파케이 손상 사고 때 7시간 동안 58건 발신됐던 패턴
+    재현 방지 - 같은 실패(heartbeat_fresh 등)가 15분마다 반복돼도 두 번째
+    호출부터는 재알림하지 않는다."""
+    monkeypatch.setattr(hc, "_load_config", lambda: CFG)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"heartbeat_fresh": {"passed": False, "detail": "마지막 틱 1:02:03 전"}})
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", tmp_path / "alert_state.json")
+    sent = []
+    monkeypatch.setattr(hc.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    assert hc.main() == 1
+    # detail 텍스트(경과시간)가 바뀌어도 dedup 키(실패 항목 집합)는 동일해야 함
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"heartbeat_fresh": {"passed": False, "detail": "마지막 틱 1:17:03 전"}})
+    assert hc.main() == 1
+
+    assert len(sent) == 1
+
+
+def test_main_resends_after_reminder_interval_elapses(db_path, tmp_path, monkeypatch):
+    monkeypatch.setattr(hc, "_load_config", lambda: CFG)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": False, "detail": "broken"}})
+    state_path = tmp_path / "alert_state.json"
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", state_path)
+    sent = []
+    monkeypatch.setattr(hc.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    assert hc.main() == 1
+    assert len(sent) == 1
+
+    # 마지막 알림 시각을 REMINDER_INTERVAL 이전으로 되돌려 장시간 지속된 실패를 재현
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    old_ts = datetime.now(timezone.utc) - hc.ALERT_REMINDER_INTERVAL - timedelta(minutes=1)
+    state["last_alert_ts"] = old_ts.isoformat()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    assert hc.main() == 1
+    assert len(sent) == 2  # 장시간 지속 -> 리마인더로 재발신
+
+
+def test_main_alerts_immediately_when_failure_signature_changes(db_path, tmp_path, monkeypatch):
+    monkeypatch.setattr(hc, "_load_config", lambda: CFG)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", tmp_path / "alert_state.json")
+    sent = []
+    monkeypatch.setattr(hc.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"heartbeat_fresh": {"passed": False, "detail": "x"}})
+    assert hc.main() == 1
+
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"exchange_reachable": {"passed": False, "detail": "y"}})
+    assert hc.main() == 1
+
+    assert len(sent) == 2  # 다른 종류의 실패는 즉시 재알림(억제 대상 아님)
+
+
+def test_main_clears_alert_state_on_recovery_then_realerts_immediately(db_path, tmp_path, monkeypatch):
+    monkeypatch.setattr(hc, "_load_config", lambda: CFG)
+    monkeypatch.setattr(hc, "_resolve_db_path", lambda cfg: db_path)
+    state_path = tmp_path / "alert_state.json"
+    monkeypatch.setattr(hc, "ALERT_STATE_PATH", state_path)
+    sent = []
+    monkeypatch.setattr(hc.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": False, "detail": "broken"}})
+    hc.main()
+    assert state_path.exists()
+
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": True, "detail": "ok"}})
+    hc.main()
+    assert not state_path.exists()  # 회복 시 상태 초기화
+
+    monkeypatch.setattr(hc, "run_all_checks", lambda cfg, db: {"a": {"passed": False, "detail": "broken again"}})
+    hc.main()
+
+    assert len(sent) == 2  # 회복 이후 재발생한 동일 종류 실패는 새 실패로 취급돼 즉시 알림
