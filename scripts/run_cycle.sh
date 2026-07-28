@@ -38,17 +38,21 @@ cd "$(dirname "$0")/.."
 PIDFILE="logs/runner.pid"
 mkdir -p logs
 
-# ★ 2026-07-27 사고 대응 중 재발견(task j에서 이미 한 번 플래그됐던 미해결
-# 배포 이슈): PATH상의 bare `python`은 환경(WSL 시스템 python, 이 세션의
-# Windows 시스템 python 등)에 따라 프로젝트 의존성(yaml/ccxt/pandas 등)이
-# 없는 인터프리터를 가리킬 수 있다(logs/runner.log의 과거
-# `ModuleNotFoundError: No module named 'yaml'` 크래시가 실증). 프로젝트
-# venv 인터프리터를 명시적으로 우선 사용하도록 고정 — WSL2는 Windows
-# .exe를 경로로 직접 실행 가능하므로 .venv/Scripts/python.exe 하나로
-# 양쪽 환경 모두 커버된다(별도 .venv/bin/python은 이 프로젝트에 없음,
-# 실측 확인됨).
-if [ -x ".venv/Scripts/python.exe" ]; then
-    PYTHON_BIN=".venv/Scripts/python.exe"
+# ★ 2026-07-28 재설계(2026-07-27 킬스위치 사고 대응 중 파케이 캐시 손상을
+# 고친 뒤 재기동하다가 발견): 이 스크립트를 WSL cron이 nohup으로 실행하면서
+# `.venv/Scripts/python.exe`(Windows 네이티브 실행파일)를 WSL 인터롭으로
+# 넘기는 방식은 실측상 신뢰할 수 없었다 — 어떤 때는 시작은 되지만 계좌 조회
+# 이전 단계에서 CPU 0%로 15분 넘게 완전히 멈췄고(진행 증거 없음), WSL을
+# 완전 재기동(`wsl --shutdown`)한 뒤 재시도했을 때는 아예 `python.exe`
+# 바이너리(PE 헤더 "MZ")를 셸이 그대로 실행하려다 즉시 깨졌다(인터롭
+# binfmt 핸들러가 그 시점에 준비 안 됨으로 추정) — 재현성이 없어 운영에
+# 못 쓴다. WSL 내부에 별도 venv(`.venv-wsl`)를 만들어 Windows 실행파일
+# 경계를 아예 없앴다 — 이제 WSL 안에서 완결되는 네이티브 python3라 인터롭
+# 자체가 개입하지 않는다. 이전처럼 PATH의 bare `python`이 프로젝트
+# 의존성 없는 인터프리터를 가리킬 위험(과거 `ModuleNotFoundError: No
+# module named 'yaml'` 실증)은 여전하므로 venv 경로를 명시적으로 우선한다.
+if [ -x ".venv-wsl/bin/python" ]; then
+    PYTHON_BIN=".venv-wsl/bin/python"
 elif [ -x ".venv/bin/python" ]; then
     PYTHON_BIN=".venv/bin/python"
 else
