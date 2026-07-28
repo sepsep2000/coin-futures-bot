@@ -125,22 +125,31 @@ def _normalize_status(ccxt_status: Optional[str], filled: float = 0.0) -> str:
 
 
 def place_order(exchange, db_path: Path, symbol: str, direction: str, qty: float,
-                 order_type: str = "market", limit_price: Optional[float] = None) -> OrderResult:
+                 order_type: str = "market", limit_price: Optional[float] = None,
+                 reduce_only: bool = False) -> OrderResult:
     """주문 제출 + 즉시 주문 ID 확보. fire-and-forget 금지(CLAUDE.md) —
     이 함수는 제출만 하고 체결 확인은 poll_order_status()가 별도로 한다.
     실패 시 MAX_RETRIES(3회) 지수 백오프(2**attempt초) 후 실패 반환.
-    모든 시도 결과(성공/최종실패)를 state.save_order로 기록한다."""
+    모든 시도 결과(성공/최종실패)를 state.save_order로 기록한다.
+
+    ★ reduce_only(2026-07-27 사고 대응 추가): 기본값 False로 기존 호출부
+    전부 동작 불변. 청산/킬스위치처럼 "포지션을 줄이기만 해야 하는" 주문에
+    True로 넘기면 거래소가 방향 실수로 포지션을 반대로 뒤집거나 배증시키는
+    것 자체를 원천 차단한다(reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md 7절
+    긴급 청산 시 실사용 검증됨) - 로컬 상태가 실수로 틀리더라도 거래소가
+    한 번 더 막아주는 안전망."""
     side = _side_from_direction(direction)
     last_error: Optional[str] = None
+    params = {"reduceOnly": True} if reduce_only else {}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if order_type == "market":
-                order = exchange.create_order(symbol, "market", side, qty)
+                order = exchange.create_order(symbol, "market", side, qty, None, params)
             elif order_type == "limit":
                 if limit_price is None:
                     raise ValueError("order_type='limit'이면 limit_price가 필요합니다")
-                order = exchange.create_order(symbol, "limit", side, qty, limit_price)
+                order = exchange.create_order(symbol, "limit", side, qty, limit_price, params)
             else:
                 raise ValueError(f"지원하지 않는 order_type: {order_type!r}")
 

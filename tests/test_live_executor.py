@@ -44,7 +44,7 @@ class _OrderStubExchange:
         self.average = average
         self.calls = 0
 
-    def create_order(self, symbol, order_type, side, qty, price=None):
+    def create_order(self, symbol, order_type, side, qty, price=None, params=None):
         self.calls += 1
         if self.always_fail:
             raise RuntimeError("simulated exchange error")

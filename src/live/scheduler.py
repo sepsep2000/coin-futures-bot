@@ -163,22 +163,54 @@ def _execute_kill_switch_liquidation(db_path: Path, exec_exchange, consecutive_e
     실패해도(이미 API가 불안정한 상황이니 충분히 가능) executor.place_order가
     예외를 던지지 않고 status="failed"를 반환하므로 이 함수는 안전하게
     끝까지 순회한다 — 청산 성공/실패 목록을 전부 CRITICAL에 담아 사람이
-    무엇이 남았는지 즉시 알 수 있게 한다(방치 금지)."""
-    positions = live_state.load_open_positions(db_path)
+    무엇이 남았는지 즉시 알 수 있게 한다(방치 금지).
+
+    ★ [2026-07-27 사고 대응, reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md 2.3절]
+    청산 대상/수량은 반드시 `exec_exchange.fetch_positions()`(실제 거래소)에서
+    구한다 — 로컬 DB(`live_state.load_open_positions`)는 참고(전략 라벨링)
+    용도로만 쓴다. 사고 당시 로컬 DB가 이미 오염된 상태(실제로는 청산 안
+    됐는데 partial_taken 갱신 실패로 stale)였는데, 킬스위치가 그 DB만 믿고
+    청산 방향/수량을 결정해 실제로는 포지션을 배증시켰다 — "안전장치가
+    안전장치 자신의 입력을 검증하지 않는" 결함이었다. 또한 방향 실수로
+    같은 사고가 재발하는 것 자체를 막기 위해 reduce_only=True로 주문한다
+    (거래소 레벨에서 포지션 반전/배증을 원천 차단, 7절 긴급 청산에서 실사용
+    검증됨)."""
+    real_positions = [
+        p for p in exec_exchange.fetch_positions()
+        if p.get("contracts") and float(p["contracts"]) != 0
+    ]
+    db_positions_by_symbol = {p["symbol"]: p for p in live_state.load_open_positions(db_path)}
+
     liquidated: list[str] = []
     failed: list[str] = []
-    for pos in positions:
-        close_direction = "short" if pos["direction"] == "long" else "long"
-        result = executor.place_order(exec_exchange, db_path, pos["symbol"], close_direction, pos["qty"])
+    for p in real_positions:
+        symbol = p["symbol"]
+        qty = abs(float(p["contracts"]))
+        exchange_direction = "long" if p.get("side") == "long" else "short"
+        close_direction = "short" if exchange_direction == "long" else "long"
+        db_pos = db_positions_by_symbol.get(symbol)
+        strategy_label = db_pos["strategy"] if db_pos else "DB에 기록 없음(거래소 실측으로만 발견)"
+
+        result = executor.place_order(exec_exchange, db_path, symbol, close_direction, qty, reduce_only=True)
         if result.status == "filled":
-            live_state.delete_position(db_path, pos["symbol"], pos["strategy"])
-            liquidated.append(f"{pos['symbol']}({pos['strategy']})")
+            if db_pos:
+                live_state.delete_position(db_path, symbol, db_pos["strategy"])
+            liquidated.append(f"{symbol}({strategy_label})")
         else:
-            failed.append(f"{pos['symbol']}({pos['strategy']})")
+            failed.append(f"{symbol}({strategy_label})")
+
+    # 실거래소엔 없는데 DB에만 남아있는 stale 레코드도 함께 정리(청산할 실물이 없으므로
+    # 주문 없이 삭제만) - 그대로 두면 다음 재시작 때 recover_state()가 다시 혼란을 일으킨다.
+    stale_db_only = [s for s in db_positions_by_symbol if s not in {p["symbol"] for p in real_positions}]
+    for symbol in stale_db_only:
+        strategy = db_positions_by_symbol[symbol]["strategy"]
+        live_state.delete_position(db_path, symbol, strategy)
 
     telegram.send_critical_alert(
         f"연속오류 킬스위치 발동({consecutive_errors}회 연속 실패) - 봇 정지. "
-        f"청산 완료: {liquidated or '없음'}. 청산 실패(수동 확인 필요): {failed or '없음'}."
+        f"청산 완료(거래소 실측 기준): {liquidated or '없음'}. "
+        f"청산 실패(수동 확인 필요): {failed or '없음'}. "
+        f"DB에만 남아있던 stale 레코드 정리: {stale_db_only or '없음'}."
     )
 
 
@@ -514,10 +546,21 @@ def _manage_open_filtered_trend_position(db_path: Path, exec_exchange, pos: dict
                 f"filtered_trend 청산 주문({trade.exit_reason}) 미체결 - 수동 확인 필요: {FT_SYMBOL} qty={trade.qty}"
             )
             continue
-        real_r_multiple = _current_r_multiple(position, result.avg_fill_price)
+        # 2026-07-27 사고 대응: market 주문의 create_order 응답이 average(체결평균가)를
+        # None으로 반환하는 경우가 실측으로 확인됨(ccxt/바이낸스 타이밍 특성, 실제로는
+        # 정상 체결됨) - line 459(진입 경로)와 동일하게 None 가드 필요. 진입 경로는
+        # 시뮬레이션 entry_price로 폴백하지만 청산 경로엔 그런 값이 없으므로, 사용자
+        # 지시대로 거래소 현재가(mark price) 재조회로 폴백한다. 이 가드가 없으면
+        # _current_r_multiple()이 TypeError를 던지고, 그 크래시가 place_order(주문은
+        # 이미 실체결됨) 이후·save_position(상태 영속화) 이전에 발생해 다음 틱에
+        # 같은 청산이 중복 실행되는 사고로 이어졌다(reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md).
+        real_fill_price = result.avg_fill_price
+        if real_fill_price is None:
+            real_fill_price = exec_exchange.fetch_ticker(FT_SYMBOL)["last"]
+        real_r_multiple = _current_r_multiple(position, real_fill_price)
         telegram.send_entry_exit_notification(
             symbol=FT_SYMBOL, strategy="filtered_trend", direction=position.direction, regime="trend",
-            qty=trade.qty, price=result.avg_fill_price, r_multiple=real_r_multiple,
+            qty=trade.qty, price=real_fill_price, r_multiple=real_r_multiple,
             cumulative_pnl_usd=total_equity - account_cfg["initial_equity_usd"],
         )
 

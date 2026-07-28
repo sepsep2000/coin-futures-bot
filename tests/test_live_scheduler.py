@@ -338,11 +338,19 @@ class _StubMarketOrderExchange:
     갖춰 스탑 스윕이 조용히(에러 로그 없이) 통과하게 한다 - 이 테스트의
     관심사는 청산 로직이지 스탑 배치 자체가 아니므로."""
 
-    def __init__(self, fill_price: float = 100.0, always_fail: bool = False):
+    def __init__(self, fill_price: float = 100.0, always_fail: bool = False, real_positions: list[dict] | None = None):
         self.fill_price = fill_price
         self.always_fail = always_fail
         self.calls: list[dict] = []
         self._algo_orders: list[dict] = []
+        # 2026-07-27 사고 대응(reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md) - 킬스위치가
+        # 이제 fetch_positions()를 청산 대상의 근거로 쓰므로, 테스트가 "거래소 실측"을
+        # 직접 지정할 수 있어야 한다(기본값은 빈 리스트 - 명시적으로 지정 안 하면
+        # 실측상 포지션 없음으로 취급, DB만 보고 청산하던 예전 동작을 그대로 재현하지 않음).
+        self._real_positions = real_positions if real_positions is not None else []
+
+    def fetch_positions(self):
+        return list(self._real_positions)
 
     def create_order(self, symbol, order_type, side, qty, price=None, params=None):
         if order_type == "STOP_MARKET":
@@ -351,7 +359,7 @@ class _StubMarketOrderExchange:
                 "side": side.upper(), "algoStatus": "NEW",
             })
             return {"id": f"STOP{len(self._algo_orders)}"}
-        self.calls.append({"symbol": symbol, "side": side, "qty": qty})
+        self.calls.append({"symbol": symbol, "side": side, "qty": qty, "reduceOnly": (params or {}).get("reduceOnly")})
         if self.always_fail:
             raise RuntimeError("simulated exchange error")
         return {"id": f"ORD{len(self.calls)}", "status": "closed", "filled": qty, "average": self.fill_price}
@@ -416,7 +424,7 @@ def test_manage_open_position_stop_loss_full_fill_deletes_position(db_path, monk
     )
 
     assert load_open_positions(db_path, strategy="filtered_trend") == []  # 실제 체결 -> 포지션 삭제
-    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": 1.0}]
+    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": 1.0, "reduceOnly": None}]
     assert len(sent) == 1
     assert sent[0]["price"] == 94.5  # 시뮬레이션 가격이 아니라 실제 체결가 보고
 
@@ -510,7 +518,7 @@ def test_manage_open_position_partial_tp_reduces_qty_and_moves_stop_to_breakeven
     # 있음(engine.py 로직 그대로) - 정확한 트레일 값을 손으로 재계산하는
     # 대신 "본전 이상으로만 움직인다"는 불변식을 확인한다.
     assert remaining[0]["current_stop"] >= 100.0
-    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": pytest.approx(0.25)}]
+    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": pytest.approx(0.25), "reduceOnly": None}]
     assert len(sent) == 1
     assert sent[0]["price"] == 107.6
 
@@ -577,7 +585,11 @@ def test_execute_kill_switch_liquidation_closes_all_positions_both_strategies(db
     save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "2026-07-25T00:00:00Z", 2900.0)
     save_position(db_path, "BTC/USDT:USDT", "2a", "short", 0.01, 60000.0, "2026-07-25T00:00:00Z", 78000.0)
 
-    exchange = _StubMarketOrderExchange(fill_price=100.0)
+    # DB와 거래소가 일치하는 정상 케이스 - 거래소 실측(fetch_positions)이 DB와 같은 내용을 보고한다.
+    exchange = _StubMarketOrderExchange(fill_price=100.0, real_positions=[
+        {"symbol": "ETH/USDT:USDT", "contracts": 1.0, "side": "long"},
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "short"},
+    ])
     sent = []
     monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
 
@@ -586,6 +598,7 @@ def test_execute_kill_switch_liquidation_closes_all_positions_both_strategies(db
     assert load_open_positions(db_path) == []  # 양쪽 전략 모두 청산됨
     closed_symbols = {c["symbol"] for c in exchange.calls}
     assert closed_symbols == {"ETH/USDT:USDT", "BTC/USDT:USDT"}
+    assert all(c["reduceOnly"] is True for c in exchange.calls)  # 배증 방지 안전장치
     assert len(sent) == 1
     assert "5회" in sent[0]
 
@@ -595,7 +608,9 @@ def test_execute_kill_switch_liquidation_reports_failed_closes_without_deleting_
     상황) 그 포지션은 state에서 지우지 않는다 - 공허한 성공 금지."""
     save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "2026-07-25T00:00:00Z", 2900.0)
 
-    exchange = _StubMarketOrderExchange(always_fail=True)
+    exchange = _StubMarketOrderExchange(always_fail=True, real_positions=[
+        {"symbol": "ETH/USDT:USDT", "contracts": 1.0, "side": "long"},
+    ])
     sent = []
     monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
 
@@ -605,6 +620,43 @@ def test_execute_kill_switch_liquidation_reports_failed_closes_without_deleting_
     assert len(remaining) == 1  # 청산 실패 - state 유지(방치와는 다름, 명시적으로 남겨서 사람이 보게 함)
     assert len(sent) == 1
     assert "ETH/USDT:USDT" in sent[0]  # 실패 목록에 포함돼 CRITICAL로 보고됨
+
+
+def test_execute_kill_switch_liquidation_uses_exchange_not_db_when_they_disagree(db_path, monkeypatch):
+    """★ 회귀 테스트(2026-07-27 사고 재현 방지, reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md
+    2.3절) - DB는 낡은 값(qty=2.077 롱)을 갖고 있지만 실제 거래소는 이미 다른 상태
+    (순숏 -2.075)인 상황을 재현한다. 청산은 반드시 거래소 실측(숏 2.075, 이를 닫으려면
+    buy)을 따라야 하며, DB의 stale 값(롱 2.077, sell로 착각)을 따라가면 안 된다 —
+    이게 바로 사고 당시 포지션을 배증시킨 원인이었다."""
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 2.077, 1937.28, "2026-07-26T22:15:00Z", 1900.0)
+
+    exchange = _StubMarketOrderExchange(fill_price=1955.0, real_positions=[
+        {"symbol": "ETH/USDT:USDT", "contracts": 2.075, "side": "short"},
+    ])
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: True)
+
+    scheduler._execute_kill_switch_liquidation(db_path, exchange, consecutive_errors=5)
+
+    assert len(exchange.calls) == 1
+    call = exchange.calls[0]
+    assert call["side"] == "buy"  # 숏을 닫으려면 buy - DB(롱 -> sell)를 따랐다면 틀렸을 것
+    assert call["qty"] == 2.075  # 거래소 실측 수량 - DB의 2.077이 아님
+    assert call["reduceOnly"] is True
+
+
+def test_execute_kill_switch_liquidation_cleans_up_stale_db_only_records(db_path, monkeypatch):
+    """거래소엔 이미 없는데 DB에만 남아있는 레코드(예: 사고로 상태갱신이 실패한 채
+    방치된 행)는 청산 주문 없이(실물이 없으므로) 삭제만 한다 - 다음 재시작 때
+    recover_state()가 또 혼란을 일으키지 않도록."""
+    save_position(db_path, "BTC/USDT:USDT", "2a", "short", 0.01, 60000.0, "2026-07-25T00:00:00Z", 78000.0)
+
+    exchange = _StubMarketOrderExchange(real_positions=[])  # 거래소엔 아무 포지션도 없음
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: True)
+
+    scheduler._execute_kill_switch_liquidation(db_path, exchange, consecutive_errors=5)
+
+    assert exchange.calls == []  # 청산할 실물이 없으므로 주문 자체를 내지 않음
+    assert load_open_positions(db_path) == []  # stale 레코드는 삭제됨
 
 
 # =====================================================================
