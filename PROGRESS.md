@@ -1,5 +1,42 @@
 # PROGRESS.md
 
+## 2026-07-29 — 텔레그램 알림 피로 완화 (사용자 피드백: "너무 자주 옴, 쓸데없는거 안오게 해")
+
+**배경**: WSL 유휴-정지 문제(전날 발견)로 봇이 다시 멈춰있는 걸 확인해 수동
+재기동하던 중, 사용자가 텔레그램 알림이 너무 잦다고 피드백. 원인 조사 결과
+두 가지 확인.
+
+**원인 1 (상시 노이즈, 하루 96건)**: `scripts/healthcheck.py::check_telegram_reachable()`
+가 15분마다 `telegram.send_message()`로 **실제 채팅 메시지**("[HEALTHCHECK]
+텔레그램 발신 정상 확인")를 보내고 있었다 - 아무 문제가 없어도 하루 96번씩
+쌓이는 순수 낭비. `src/notify/telegram.py`에 `check_reachable()` 신설 -
+`bot.get_me()`만 호출해 토큰/네트워크는 검증하되 채팅 메시지는 전혀 안 보냄.
+`check_telegram_reachable()`이 이걸 쓰도록 교체.
+
+**원인 2 (장애 시 폭주, 실측 58건/7시간)**: `main()`이 실패를 발견할 때마다
+매번 새 CRITICAL을 발신 - 같은 장애가 지속되는 동안 15분마다 거의 동일한
+메시지가 반복됐다(전날 파케이 손상 사고 때 실측 58건). `_should_send_failure_alert()`
+신설: 실패 항목 이름의 **집합**(detail 텍스트가 아님 - heartbeat_fresh의
+경과시간처럼 매번 바뀌는 값 때문에 텍스트 기준 dedup은 무의미)을 dedup
+키로 써서, 새 종류의 실패는 즉시 알리되 같은 실패가 지속되면
+`ALERT_REMINDER_INTERVAL`(2시간)마다만 재알림. 상태는 `logs/healthcheck_alert_state.json`
+에 저장, 회복 시 초기화(다음에 재발하면 다시 "새 실패"로 즉시 알림).
+
+**영향 없는 것(그대로 유지)**: 실거래 이벤트(진입/청산/리밸런스), 킬스위치
+발동, 일일요약 등 `send_entry_exit_notification`/`send_rebalance_notification`
+계열은 손대지 않음 - 사용자가 원한 건 "쓸데없는" 반복/자동확인 알림 억제이지
+실제 거래/장애 신호 자체를 줄이는 게 아니므로.
+
+**테스트**: 신규 11개(telegram.check_reachable 3개: 정상/자격증명누락/네트워크
+오류, healthcheck dedup 6개: 정상/경계/실패 + 시그니처변경시즉시알림/회복시
+초기화/재발생시즉시알림, healthcheck telegram_reachable이 send_message를
+안 부르는지 회귀 1개). Windows/WSL 양쪽 venv에서 `tests/ -x -q` 310/310 통과.
+
+**미해결**: scheduler.py의 틱 실패(`_tick 실패`) CRITICAL도 같은 패턴으로
+반복 가능성 있음(장애 지속 시 5회 연속실패마다 킬스위치→프로세스 재시작→
+카운터 리셋→다시 5회 반복 사이클) - 이번 범위는 healthcheck.py로 한정,
+필요시 별도 요청.
+
 ## 2026-07-28 — 클로드 코드 세션 유실 후 전면 재점검 + 파케이 캐시 손상 사고 대응
 
 **배경**: 로컬 클로드 코드 앱이 강제종료되어 이전 세션 컨텍스트 유실. 재점검 결과
