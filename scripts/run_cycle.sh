@@ -38,12 +38,29 @@ cd "$(dirname "$0")/.."
 PIDFILE="logs/runner.pid"
 mkdir -p logs
 
+# ★ 2026-07-27 사고 대응 중 재발견(task j에서 이미 한 번 플래그됐던 미해결
+# 배포 이슈): PATH상의 bare `python`은 환경(WSL 시스템 python, 이 세션의
+# Windows 시스템 python 등)에 따라 프로젝트 의존성(yaml/ccxt/pandas 등)이
+# 없는 인터프리터를 가리킬 수 있다(logs/runner.log의 과거
+# `ModuleNotFoundError: No module named 'yaml'` 크래시가 실증). 프로젝트
+# venv 인터프리터를 명시적으로 우선 사용하도록 고정 — WSL2는 Windows
+# .exe를 경로로 직접 실행 가능하므로 .venv/Scripts/python.exe 하나로
+# 양쪽 환경 모두 커버된다(별도 .venv/bin/python은 이 프로젝트에 없음,
+# 실측 확인됨).
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PYTHON_BIN=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+    PYTHON_BIN=".venv/bin/python"
+else
+    PYTHON_BIN="python"
+fi
+
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "[$(date -u +%FT%TZ)] runner.py 이미 실행 중(PID $(cat "$PIDFILE")) - 아무것도 안 함"
     exit 0
 fi
 
-echo "[$(date -u +%FT%TZ)] runner.py 실행 중이 아님 - 시작"
-nohup python src/live/runner.py >> logs/runner.log 2>&1 &
+echo "[$(date -u +%FT%TZ)] runner.py 실행 중이 아님 - 시작($PYTHON_BIN)"
+nohup "$PYTHON_BIN" src/live/runner.py >> logs/runner.log 2>&1 &
 echo $! > "$PIDFILE"
 echo "[$(date -u +%FT%TZ)] runner.py 시작됨(PID $!)"
