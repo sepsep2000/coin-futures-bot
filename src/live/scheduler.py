@@ -456,14 +456,18 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
         return  # 포지션이 있으면(청산했든 아니든) 이번 틱엔 신규진입 평가 안 함
 
     if entries_blocked:
+        _log_stderr(f"filtered_trend 진단({ts}): entries_blocked=True(일일손실한도) - 신규진입 평가 스킵")
         return
     if not can_open_new_position(set(), FT_SYMBOL, account_cfg["max_concurrent_positions"]):
+        _log_stderr(f"filtered_trend 진단({ts}): can_open_new_position=False - 신규진입 스킵")
         return
 
     regime_cfg = cfg["regime"]
     regime_1h = classify_regime(df_1h, regime_cfg)
     regime_15m = regime_1h.reindex(df_15m.index, method="ffill")
-    if regime_15m.iloc[-1] != TREND:
+    current_regime = regime_15m.iloc[-1]
+    if current_regime != TREND:
+        _log_stderr(f"filtered_trend 진단({ts}): regime={current_regime}(TREND 아님) - 신규진입 평가 스킵")
         return
 
     trend_sig = generate_trend_signals(df_15m, trend_cfg)
@@ -473,7 +477,20 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
 
     trow = trend_sig.iloc[-1]
     direction = "long" if bool(trow["entry_long"]) else ("short" if bool(trow["entry_short"]) else None)
-    if direction is None or not _momentum_agrees(direction, roc_15m.iloc[-1]):
+    current_roc = roc_15m.iloc[-1]
+    # ★ 2026-08-01(사용자 발견): 2026-07-31 14:00/14:15 UTC 두 틱 모두 사후
+    # 재현 시 진입조건이 전부 충족돼 있었는데도(regime=TREND, 숏 브레이크아웃
+    # 확정, 모멘텀 합치, qty>0) 실제로는 주문이 안 나갔고 에러/CRITICAL도
+    # 전혀 없었다 - "조용한 스킵"이라 원인을 사후에 특정할 수 없었다(로그가
+    # 아예 없었으므로). 이후 각 분기(regime/방향-모멘텀/수량/체결)마다 스킵
+    # 사유를 반드시 남긴다 - CRITICAL이 아니라 로컬 로그(runner.log)로만,
+    # 알림 폭주 방지 원칙(2026-07-29)과는 별개 - 이건 텔레그램이 아니라
+    # 사후진단용 로컬 기록이다.
+    if direction is None:
+        _log_stderr(f"filtered_trend 진단({ts}): regime=TREND, 브레이크아웃 신호 없음(entry_long/short 둘 다 False)")
+        return
+    if not _momentum_agrees(direction, current_roc):
+        _log_stderr(f"filtered_trend 진단({ts}): regime=TREND, direction={direction} 신호 있으나 모멘텀 불일치(roc={current_roc}) - 진입 스킵")
         return
 
     initial_stop = trow["initial_stop_long"] if direction == "long" else trow["initial_stop_short"]
@@ -483,10 +500,16 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
     qty = position_size(leg_equity, entry_price, initial_stop, account_cfg["risk_per_trade_pct"],
                          max_leverage=account_cfg["leverage"], qty_step=step, min_qty=minq)
     if qty <= 0:
+        _log_stderr(
+            f"filtered_trend 진단({ts}): regime=TREND, direction={direction}, 모멘텀 일치, "
+            f"qty<=0({qty}) - 진입 스킵(step={step}, min={minq}, leg_equity={leg_equity:.2f})"
+        )
         return
 
+    _log_stderr(f"filtered_trend 진단({ts}): regime=TREND, direction={direction}, qty={qty} - 주문 시도")
     result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, direction, qty)
     if result.status != "filled":
+        _log_stderr(f"filtered_trend 진단({ts}): 주문 시도했으나 체결 안 됨(status={result.status}) - 포지션 미생성")
         return
     real_entry_price = result.avg_fill_price or entry_price
     notional = qty * real_entry_price

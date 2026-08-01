@@ -110,6 +110,14 @@ def test_real_testnet_single_tick_filtered_trend_path(db_path, capsys):
     assert api_secret not in captured.out
     assert api_secret not in captured.err
 
+    # ★ 2026-08-01(사용자 발견) 회귀 테스트: 2026-07-31 14:00/14:15 UTC
+    # 두 틱 모두 진입조건이 충족돼 있었는데도 실제로는 조용히 스킵됐고
+    # 로그가 전혀 없어 사후에 원인을 특정할 수 없었다. 신규진입을 안 했다면
+    # (positions == 0) 반드시 진단 로그가 남아야 한다 - "조용한 스킵" 자체를
+    # 회귀로 잡는다(실제 testnet/실시장 데이터로).
+    if len(positions) == 0:
+        assert "filtered_trend 진단" in captured.err
+
 
 @pytest.mark.integration
 def test_real_testnet_2a_rebalance_bounded_cycle(db_path):

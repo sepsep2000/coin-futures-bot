@@ -699,3 +699,133 @@ def test_run_live_loop_writes_heartbeat_after_success_and_after_failure(db_path,
     heartbeat_path.unlink()
     scheduler.run_live_loop({"mode": "testnet"}, db_path, max_iterations=1)
     assert heartbeat_path.exists()  # 실패해도 갱신됨(루프는 살아있으므로)
+
+
+# =====================================================================
+# _process_filtered_trend_tick 진단 로깅 (2026-08-01, 사용자 발견) —
+# 2026-07-31 14:00/14:15 UTC 두 틱 모두 사후 재현 시 진입조건이 전부
+# 충족돼 있었는데도 실제로는 주문이 안 나갔고 에러/CRITICAL도 전혀 없어
+# 원인을 사후에 특정할 수 없었다("조용한 스킵"). 신규진입을 스킵하는
+# 모든 분기가 반드시 로컬 로그(stderr, runner.log)를 남기는지 검증한다.
+# 데이터 계층(update_ohlcv_cache 등)은 네트워크가 필요해 이 파일의 다른
+# 테스트와 같은 이유로 스텁 처리한다(파일 상단 docstring 참조) — 대신
+# classify_regime/generate_trend_signals/_momentum_agrees/position_size를
+# 직접 스텁해 각 분기를 결정론적으로 재현한다.
+# =====================================================================
+
+FT_CFG = {
+    "account": {
+        "risk_per_trade_pct": 0.5, "leverage": 2, "max_concurrent_positions": 3,
+        "initial_equity_usd": 10000.0,
+    },
+    "trend": {},
+    "costs": {"taker_fee_pct": 0.05, "slippage_pct": 0.03},
+    "data": {"ohlcv_cache_dir": "data/ohlcv", "funding_cache_dir": "data/funding"},
+    "portfolio": {"weights": {"filtered_trend": 0.8}},
+    "regime": {},
+}
+
+
+@pytest.fixture
+def _stub_data_layer(monkeypatch):
+    """네트워크 없이 _process_filtered_trend_tick의 데이터 로딩 앞단을
+    통과시키는 최소 더미 OHLCV/펀딩 데이터."""
+    idx15 = pd.date_range("2026-07-31 12:00:00", periods=8, freq="15min", tz="UTC")
+    dummy_15m = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0}, index=idx15)
+    idx1h = pd.date_range("2026-07-31 11:00:00", periods=3, freq="1h", tz="UTC")
+    dummy_1h = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0}, index=idx1h)
+    dummy_funding = pd.DataFrame({"timestamp": [0], "funding_rate": [0.0001]})
+
+    monkeypatch.setattr(scheduler, "update_ohlcv_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "update_funding_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "_load_and_index", lambda path: dummy_1h if "1h" in path.name else dummy_15m)
+    monkeypatch.setattr(scheduler, "load_cache", lambda path: dummy_funding)
+    return idx15[-1]  # ts로 쓸 마지막 15분봉 시각
+
+
+def test_process_filtered_trend_tick_logs_when_entries_blocked(db_path, _stub_data_layer, capsys):
+    """정상: 일일손실한도로 막힌 경우 즉시 스킵 사유를 로그로 남긴다."""
+    ts = _stub_data_layer
+    scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, True)
+
+    captured = capsys.readouterr()
+    assert "entries_blocked=True" in captured.err
+
+
+def test_process_filtered_trend_tick_logs_when_regime_not_trend(db_path, _stub_data_layer, monkeypatch, capsys):
+    """정상: 국면이 TREND가 아니면 신호 계산 없이 스킵하고 사유를 남긴다."""
+    ts = _stub_data_layer
+    monkeypatch.setattr(scheduler, "classify_regime", lambda df, cfg: pd.Series("RANGE", index=df.index))
+
+    scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
+
+    captured = capsys.readouterr()
+    assert "regime=RANGE" in captured.err
+
+
+def test_process_filtered_trend_tick_logs_when_qty_zero(db_path, _stub_data_layer, monkeypatch, capsys):
+    """경계: 신호/모멘텀은 충족되지만 사이징 결과 qty<=0이면 스킵하고
+    이유(step/min/leg_equity)까지 로그에 남긴다 - 2026-07-31 사고급 상황을
+    다음엔 로그만으로 바로 구분할 수 있게 하는 게 이 기능의 핵심 목적."""
+    ts = _stub_data_layer
+    monkeypatch.setattr(scheduler, "classify_regime", lambda df, cfg: pd.Series("TREND", index=df.index))
+    monkeypatch.setattr(scheduler, "generate_trend_signals", lambda df, cfg: pd.DataFrame(
+        {"entry_long": True, "entry_short": False, "initial_stop_long": 90.0, "initial_stop_short": 110.0},
+        index=df.index,
+    ))
+    monkeypatch.setattr(scheduler, "_momentum_agrees", lambda direction, roc: True)
+    monkeypatch.setattr(scheduler, "_qty_step_and_min", lambda exchange, symbol: (0.001, 0.001))
+    monkeypatch.setattr(scheduler, "position_size", lambda *a, **k: 0.0)
+
+    scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
+
+    captured = capsys.readouterr()
+    assert "qty<=0" in captured.err
+    assert "direction=long" in captured.err
+
+
+def test_process_filtered_trend_tick_logs_when_order_not_filled(db_path, _stub_data_layer, monkeypatch, capsys):
+    """실패: 조건이 전부 충족돼 주문을 실제로 시도했지만 체결되지 않은
+    경우도 조용히 넘어가지 않고 로그를 남긴다."""
+    ts = _stub_data_layer
+    monkeypatch.setattr(scheduler, "classify_regime", lambda df, cfg: pd.Series("TREND", index=df.index))
+    monkeypatch.setattr(scheduler, "generate_trend_signals", lambda df, cfg: pd.DataFrame(
+        {"entry_long": True, "entry_short": False, "initial_stop_long": 90.0, "initial_stop_short": 110.0},
+        index=df.index,
+    ))
+    monkeypatch.setattr(scheduler, "_momentum_agrees", lambda direction, roc: True)
+    monkeypatch.setattr(scheduler, "_qty_step_and_min", lambda exchange, symbol: (0.001, 0.001))
+    monkeypatch.setattr(scheduler, "position_size", lambda *a, **k: 1.0)
+    monkeypatch.setattr(scheduler.executor, "place_order",
+                         lambda *a, **k: SimpleNamespace(status="failed", avg_fill_price=None))
+
+    scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
+
+    captured = capsys.readouterr()
+    assert "주문 시도" in captured.err  # 시도했다는 로그
+    assert "체결 안 됨" in captured.err  # 실패했다는 로그
+
+
+def test_process_filtered_trend_tick_logs_attempt_before_placing_order(db_path, _stub_data_layer, monkeypatch, capsys):
+    """정상(성공 경로): 조건이 전부 충족되면 주문을 넣기 직전에도 로그를
+    남긴다 - 이후 place_order 자체가 예외로 죽어도(테스트 범위 밖) 최소한
+    "시도했다"는 흔적은 남아야 한다는 걸 보장."""
+    ts = _stub_data_layer
+    monkeypatch.setattr(scheduler, "classify_regime", lambda df, cfg: pd.Series("TREND", index=df.index))
+    monkeypatch.setattr(scheduler, "generate_trend_signals", lambda df, cfg: pd.DataFrame(
+        {"entry_long": True, "entry_short": False, "initial_stop_long": 90.0, "initial_stop_short": 110.0},
+        index=df.index,
+    ))
+    monkeypatch.setattr(scheduler, "_momentum_agrees", lambda direction, roc: True)
+    monkeypatch.setattr(scheduler, "_qty_step_and_min", lambda exchange, symbol: (0.001, 0.001))
+    monkeypatch.setattr(scheduler, "position_size", lambda *a, **k: 1.0)
+    monkeypatch.setattr(scheduler.executor, "place_order",
+                         lambda *a, **k: SimpleNamespace(status="filled", avg_fill_price=100.0))
+    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **k: True)
+
+    scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
+
+    captured = capsys.readouterr()
+    assert "qty=1.0 - 주문 시도" in captured.err
+    assert load_open_positions(db_path, strategy="filtered_trend") != []  # 실제로 진입까지 됐는지도 같이 확인
