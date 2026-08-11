@@ -222,12 +222,32 @@ def _sleep_until_next_tick(ts: pd.Timestamp) -> None:
     time.sleep(wait_sec)
 
 
+def _handle_stop_result(db_path: Path, symbol: str, strategy: str, direction: str,
+                         stop_result) -> None:
+    """★ 2026-08-11 사고② 대응: ensure_stop_placed()가 스탑 대신 즉시
+    시장가 청산으로 대체한 경우(closed_instead=True), 그 결과를 호출부가
+    반드시 반영해야 한다 - 안 하면 거래소는 이미 포지션이 없는데 DB엔
+    여전히 열려있는 것으로 남아 다음 틱에서 혼란을 일으킨다(이 프로젝트가
+    반복적으로 지적해 온 "로컬 상태 vs 거래소 실측 불일치" 패턴 재발
+    방지). stop_confirmed=False인데 closed_instead도 False인 경우는
+    executor.py가 이미 CRITICAL로 로깅했으므로 여기서 추가로 할 일 없음."""
+    if not stop_result.closed_instead:
+        return
+    live_state.delete_position(db_path, symbol, strategy)
+    close = stop_result.close_result
+    telegram.send_critical_alert(
+        f"{symbol}({strategy}) {direction} 포지션: 스탑 배치가 거래소에서 거부(이미 트리거 조건 충족)돼 "
+        f"대신 reduceOnly 시장가로 즉시청산함 - qty={close.filled_qty}, 체결가={close.avg_fill_price}"
+    )
+
+
 def _tick(cfg: dict, db_path: Path, data_exchange, exec_exchange, ts: pd.Timestamp) -> None:
     """15m 틱 1회 처리 — 순서는 모듈 docstring 및
     reports/REBALANCE_ORDER_ANALYSIS.md 3절 확정 순서 그대로."""
     for pos in live_state.load_open_positions(db_path):
         position = SimpleNamespace(direction=pos["direction"], qty=pos["qty"], current_stop=pos["current_stop"])
-        executor.ensure_stop_placed(exec_exchange, db_path, pos["symbol"], position)
+        stop_result = executor.ensure_stop_placed(exec_exchange, db_path, pos["symbol"], position)
+        _handle_stop_result(db_path, pos["symbol"], pos["strategy"], pos["direction"], stop_result)
 
     daily_pnl, total_equity = _get_daily_pnl_and_equity(cfg, db_path, exec_exchange, ts)
     entries_blocked = daily_loss_limit_breached(daily_pnl, total_equity, cfg["account"]["daily_loss_limit_pct"])
@@ -369,7 +389,9 @@ def _process_2a_rebalance(cfg: dict, db_path: Path, data_exchange, exec_exchange
         entry_time = ts.isoformat()
         catastrophic_stop = entry_price * (1 - CATASTROPHIC_STOP_PCT if direction == "long" else 1 + CATASTROPHIC_STOP_PCT)
         live_state.save_position(db_path, symbol, "2a", direction, qty, entry_price, entry_time, catastrophic_stop)
-        executor.ensure_stop_placed(exec_exchange, db_path, symbol, SimpleNamespace(direction=direction, qty=qty, current_stop=catastrophic_stop))
+        stop_result = executor.ensure_stop_placed(exec_exchange, db_path, symbol,
+                                                    SimpleNamespace(direction=direction, qty=qty, current_stop=catastrophic_stop))
+        _handle_stop_result(db_path, symbol, "2a", direction, stop_result)
 
     turnover_pct = 100.0 * (len(exited_long) + len(exited_short) + len(new_long) + len(new_short)) / max(1, len(target_long_pairs) + len(target_short_pairs))
     live_state.save_rebalance_log(
@@ -518,8 +540,14 @@ def _process_filtered_trend_tick(cfg: dict, db_path: Path, data_exchange, exec_e
                               real_entry_price, ts.isoformat(), initial_stop,
                               initial_stop=initial_stop, entry_fee_usd=entry_fee_usd,
                               funding_paid_usd=0.0, partial_taken=False)
-    executor.ensure_stop_placed(exec_exchange, db_path, FT_SYMBOL,
-                                 SimpleNamespace(direction=direction, qty=qty, current_stop=initial_stop))
+    stop_result = executor.ensure_stop_placed(exec_exchange, db_path, FT_SYMBOL,
+                                               SimpleNamespace(direction=direction, qty=qty, current_stop=initial_stop))
+    if stop_result.closed_instead:
+        # 스탑조건이 진입 직후 이미 충족돼 즉시 청산됨 - 방금 저장한 진입 상태를
+        # _handle_stop_result가 삭제하고 별도 CRITICAL로 알린다. 정상 진입인 것처럼
+        # entry 알림을 보내면(포지션은 이미 없는데) 오해를 부르므로 여기서 막는다.
+        _handle_stop_result(db_path, FT_SYMBOL, "filtered_trend", direction, stop_result)
+        return
     telegram.send_entry_exit_notification(
         symbol=FT_SYMBOL, strategy="filtered_trend", direction=direction, regime="trend",
         qty=qty, price=real_entry_price, r_multiple=None,
@@ -592,6 +620,7 @@ def _manage_open_filtered_trend_position(db_path: Path, exec_exchange, pos: dict
 
     if new_position is None:
         live_state.delete_position(db_path, FT_SYMBOL, "filtered_trend")
+        executor.cancel_stop_orders(exec_exchange, FT_SYMBOL)  # 2026-08-11: 완전청산 시 잔여 스탑 정리
         return
 
     symbol_data = SymbolData(df_15m=df_15m, df_1h=df_1h, funding=funding_df)
@@ -604,9 +633,10 @@ def _manage_open_filtered_trend_position(db_path: Path, exec_exchange, pos: dict
         initial_stop=new_position.initial_stop, entry_fee_usd=new_position.entry_fee_usd,
         funding_paid_usd=new_position.funding_paid_usd, partial_taken=new_position.partial_taken,
     )
-    executor.ensure_stop_placed(exec_exchange, db_path, FT_SYMBOL,
-                                 SimpleNamespace(direction=new_position.direction, qty=new_position.qty,
-                                                  current_stop=new_position.current_stop))
+    stop_result = executor.ensure_stop_placed(exec_exchange, db_path, FT_SYMBOL,
+                                               SimpleNamespace(direction=new_position.direction, qty=new_position.qty,
+                                                                current_stop=new_position.current_stop))
+    _handle_stop_result(db_path, FT_SYMBOL, "filtered_trend", new_position.direction, stop_result)
 
 
 def _load_and_index(path: Path):

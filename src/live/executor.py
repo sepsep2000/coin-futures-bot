@@ -52,6 +52,17 @@ class OrderResult:
     error: Optional[str] = None
 
 
+@dataclass
+class StopPlacementResult:
+    """2026-08-11 사고②③ 대응으로 ensure_stop_placed()의 반환 타입을
+    bool에서 확장 - "스탑을 못 걸었다"와 "대신 즉시 시장가로 청산했다"는
+    호출부(scheduler.py)가 서로 다르게(전자는 CRITICAL만, 후자는 포지션
+    상태 정리+알림) 처리해야 해서 bool 하나로는 구분이 안 됐다."""
+    stop_confirmed: bool
+    closed_instead: bool = False
+    close_result: Optional[OrderResult] = None
+
+
 def get_authenticated_exchange(testnet: bool = True) -> ccxt.Exchange:
     """★ 기본값 testnet=True — CLAUDE.md 규칙5(코드 기본값 절대 live 아님).
     API 키는 config/.env에서만 읽는다(python-dotenv, 기존 관례) — 값은
@@ -238,20 +249,77 @@ def _fetch_open_stop_orders(exchange, raw_symbol: str) -> list:
     return [o for o in algo_orders if o.get("symbol") == raw_symbol]
 
 
-def ensure_stop_placed(exchange, db_path: Path, symbol: str, position, max_retries: int = STOP_CHECK_MAX_RETRIES) -> bool:
+def cancel_stop_orders(exchange, symbol: str) -> int:
+    """★ 2026-08-11 사고③ 조사 중 발견: 포지션을 완전청산해도 걸어둔
+    STOP_MARKET(Algo Order)을 취소하는 코드가 어디에도 없어서 고아
+    주문으로 계속 남는다(실측: ETH 완전청산 후에도 trigger=1910.35 스탑이
+    거래소에 그대로 남아있었음). reduceOnly라 실제로 위험하진 않지만
+    (포지션이 없으면 거래소가 트리거돼도 거부) 계속 쌓이면 계정 상태를
+    읽기 어렵게 만든다. 포지션이 완전히 닫힌 직후 호출해 남은 스탑을
+    전부 정리한다. 개별 취소 실패는 로깅만 하고 나머지는 계속 시도한다
+    (fire-and-forget 금지 원칙 - 실패해도 조용히 넘어가지 않음)."""
+    raw_symbol = exchange.market(symbol)["id"]
+    open_stops = _fetch_open_stop_orders(exchange, raw_symbol)
+    cancelled = 0
+    for stop in open_stops:
+        if str(stop.get("algoStatus", "")).upper() != "NEW":
+            continue
+        try:
+            exchange.fapiPrivateDeleteAlgoOrder({"algoId": stop["algoId"]})
+            cancelled += 1
+        except Exception as exc:  # noqa: BLE001
+            _log_stderr(f"cancel_stop_orders: {symbol} algoId={stop.get('algoId')} 취소 실패: {type(exc).__name__}: {exc}")
+    return cancelled
+
+
+def _stop_condition_already_true(stop_side: str, stop_price: float, current_price: float) -> bool:
+    """sell 스탑(롱 보호)은 가격이 stop_price 이하로 떨어지면, buy 스탑(숏
+    보호)은 stop_price 이상으로 오르면 트리거된다 - Binance가 -2021로
+    거부했다는 건 이미 이 조건이 참이라는 뜻이므로, 우리도 같은 부등호로
+    직접 확인한다(거래소 판단을 재현하는 것뿐, 새 로직 아님)."""
+    if stop_side == "sell":
+        return current_price <= stop_price
+    return current_price >= stop_price
+
+
+def _safe_fetch_last_price(exchange, symbol: str) -> Optional[float]:
+    try:
+        return float(exchange.fetch_ticker(symbol)["last"])
+    except Exception as exc:  # noqa: BLE001 - 2차 조회 실패가 원래 재시도 흐름을 막으면 안 됨
+        _log_stderr(f"ensure_stop_placed: 현재가 재조회 실패({symbol}): {type(exc).__name__}: {exc}")
+        return None
+
+
+def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
+                        max_retries: int = STOP_CHECK_MAX_RETRIES) -> StopPlacementResult:
     """포지션 존재 + 스탑 부재 = 최우선 복구 대상(CLAUDE.md). 매 시도마다
     (1) 거래소에 실제로 스탑 주문이 걸려있는지 확인 (2) 없으면 배치 시도.
-    max_retries 소진 후에도 확인 안 되면 **False를 반환하고 실패 사실을
-    stderr 로그 + state.py에 명시적으로 기록**한다 — 성공한 것처럼 조용히
-    True를 반환하지 않는다(gate_verify.py의 공허한 PASS 버그와 같은 종류의
-    실수를 반복하지 않기 위한 설계).
+    max_retries 소진 후에도 확인 안 되면 **stop_confirmed=False를 반환하고
+    실패 사실을 stderr 로그 + state.py에 명시적으로 기록**한다 — 성공한
+    것처럼 조용히 True를 반환하지 않는다(gate_verify.py의 공허한 PASS
+    버그와 같은 종류의 실수를 반복하지 않기 위한 설계).
 
     ★ 실측으로 발견한 버그 수정(2026-07-25): 최초 구현은 존재 확인에
     fetch_open_orders()를 썼는데, 이 엔드포인트는 STOP_MARKET(Algo Order)을
     아예 반환하지 않아 "이미 걸려있는 스탑"을 매번 "없음"으로 오판, 매
     재시도마다 새 스탑을 중복 생성했다(테스트넷에서 중복 4건 실측 확인 후
-    전부 취소 정리 완료). fapiPrivateGetOpenAlgoOrders() 기반으로 교체."""
+    전부 취소 정리 완료). fapiPrivateGetOpenAlgoOrders() 기반으로 교체.
+
+    ★ 2026-08-11 사고③ 대응(근본원인 A): position.current_stop이 pandas
+    계산값(numpy.float64)으로 넘어오면 ccxt의 파라미터 파서가 이를 못
+    알아보고 "requires a triggerPrice"로 거부한다(직접 재현 확인 -
+    numpy.float64는 ccxt.safe_string_2가 None으로 처리, native float는
+    정상 처리). stopPrice를 보내기 직전 float()로 명시 캐스팅해 원천 차단.
+
+    ★ 2026-08-11 사고② 대응(근본원인 B): 거래소가 OrderImmediatelyFillable
+    (-2021, "이미 트리거 조건 충족")로 거부하면, 같은 가격으로 재시도해봐야
+    시장이 그 사이 되돌아오지 않는 한 결과가 똑같다 - 실측(2026-07-27)으로
+    확인된 패턴. 이 예외를 잡으면 현재가를 재조회해 정말 조건이 충족됐는지
+    확인하고, 충족됐으면 대기하는 스탑 대신 reduceOnly 시장가로 즉시
+    청산한다(스탑의 목적 자체가 "이 가격을 넘으면 즉시 나간다"이므로 이미
+    넘었으면 지금 나가는 게 취지와 정확히 같다 - 새 리스크 정책이 아님)."""
     stop_side = "sell" if position.direction == "long" else "buy"
+    stop_price = float(position.current_stop)  # 근본원인 A: native float 명시 캐스팅
     last_error: Optional[str] = None
 
     for attempt in range(1, max_retries + 1):
@@ -266,27 +334,44 @@ def ensure_stop_placed(exchange, db_path: Path, symbol: str, position, max_retri
                 for o in open_stops
             )
             if stop_exists:
-                return True
+                return StopPlacementResult(stop_confirmed=True)
 
             exchange.create_order(
                 symbol, "STOP_MARKET", stop_side, position.qty,
-                params={"stopPrice": position.current_stop, "reduceOnly": True},
+                params={"stopPrice": stop_price, "reduceOnly": True},
             )
-            # 배치 직후 이번 루프에서 바로 True 반환하지 않는다 - 다음 반복에서
-            # 실제로 걸렸는지 재확인한 뒤에만 True.
+            # 배치 직후 이번 루프에서 바로 반환하지 않는다 - 다음 반복에서
+            # 실제로 걸렸는지 재확인한 뒤에만 stop_confirmed=True.
         except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {exc}"
             _log_stderr(f"ensure_stop_placed 시도 {attempt}/{max_retries} 실패({symbol}): {last_error}")
+
+            if isinstance(exc, ccxt.OrderImmediatelyFillable):
+                current_price = _safe_fetch_last_price(exchange, symbol)
+                if current_price is not None and _stop_condition_already_true(stop_side, stop_price, current_price):
+                    close_direction = "short" if position.direction == "long" else "long"
+                    close_result = place_order(exchange, db_path, symbol, close_direction, position.qty,
+                                                reduce_only=True)
+                    if close_result.status == "filled":
+                        _log_stderr(
+                            f"ensure_stop_placed: {symbol} 스탑조건 이미 충족(현재가={current_price}, "
+                            f"스탑가={stop_price}) - 대기용 스탑 대신 reduceOnly 시장가로 즉시청산"
+                        )
+                        return StopPlacementResult(stop_confirmed=False, closed_instead=True,
+                                                    close_result=close_result)
+                    _log_stderr(
+                        f"ensure_stop_placed: {symbol} 스탑조건 충족 확인했으나 대체청산 주문도 실패"
+                        f"(status={close_result.status}) - 기존 재시도 계속"
+                    )
 
         if attempt < max_retries:
             time.sleep(2 ** attempt)
 
     # 재시도 소진 - 스탑 미확인 상태를 명확히 기록(조용히 넘어가지 않음).
     failure_id = f"STOP_MISSING_{symbol}_{position.direction}_{int(time.time())}"
-    live_state.save_order(db_path, failure_id, symbol, stop_side, position.qty,
-                           position.current_stop, "failed")
+    live_state.save_order(db_path, failure_id, symbol, stop_side, position.qty, stop_price, "failed")
     _log_stderr(
         f"CRITICAL: {symbol} {position.direction} 포지션의 스탑을 {max_retries}회 시도 후에도 "
         f"확인/배치하지 못함 (마지막 오류: {last_error}) - 즉시 수동 확인 필요"
     )
-    return False
+    return StopPlacementResult(stop_confirmed=False)

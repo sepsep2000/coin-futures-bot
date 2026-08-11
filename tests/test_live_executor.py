@@ -11,6 +11,8 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+import ccxt
+import numpy as np
 import pytest
 
 from src.live import executor
@@ -196,6 +198,7 @@ class _StopStubExchange:
 
     def create_order(self, symbol, order_type, side, qty, params=None):
         self.create_order_calls += 1
+        self.last_params = params
         if self._create_fails:
             raise RuntimeError("simulated exchange error")
         self._algo_orders.append({
@@ -214,7 +217,8 @@ def test_ensure_stop_placed_detects_existing_stop_without_duplicate(db_path):
 
     result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
 
-    assert result is True
+    assert result.stop_confirmed is True
+    assert result.closed_instead is False
     assert exchange.create_order_calls == 0
 
 
@@ -225,7 +229,7 @@ def test_ensure_stop_placed_creates_when_missing_then_confirms(db_path, monkeypa
 
     result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
 
-    assert result is True
+    assert result.stop_confirmed is True
     assert exchange.create_order_calls == 1
 
 
@@ -239,7 +243,8 @@ def test_ensure_stop_placed_retries_exhausted_returns_false_and_records_failure(
 
     result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position, max_retries=2)
 
-    assert result is False
+    assert result.stop_confirmed is False
+    assert result.closed_instead is False
     assert exchange.create_order_calls == 2
 
     with sqlite3.connect(str(db_path)) as conn:
@@ -256,8 +261,170 @@ def test_ensure_stop_placed_short_position_uses_buy_side(db_path, monkeypatch):
 
     result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
 
-    assert result is True
+    assert result.stop_confirmed is True
     assert exchange._algo_orders[-1]["side"] == "BUY"
+
+
+# =====================================================================
+# ensure_stop_placed — 2026-08-11 사고③ 회귀 테스트(근본원인 A: numpy.float64)
+# =====================================================================
+
+def test_ensure_stop_placed_casts_numpy_float_to_native(db_path, monkeypatch):
+    """정상: pandas 계산값(numpy.float64)을 current_stop으로 넘겨도 ccxt에
+    전달되는 stopPrice는 반드시 native float여야 한다 - numpy.float64는
+    ccxt.safe_string_2가 None으로 처리해 "requires a triggerPrice"로
+    거부당하는 게 실측 확인된 원인(사고③, 2026-08-10 ETH 신규진입 직후)."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    exchange = _StopStubExchange(initial_stops=[])
+    position = SimpleNamespace(direction="long", qty=0.002, current_stop=np.float64(60000.0))
+
+    result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
+
+    assert result.stop_confirmed is True
+    assert type(exchange.last_params["stopPrice"]) is float  # numpy.float64가 아니라 native float
+    assert exchange.last_params["stopPrice"] == 60000.0
+
+
+# =====================================================================
+# ensure_stop_placed — 2026-08-11 사고② 회귀 테스트(근본원인 B: 가격 레이스)
+# =====================================================================
+
+class _RaceConditionStubExchange:
+    """STOP_MARKET 배치는 매번 OrderImmediatelyFillable(-2021)로 거부되고
+    (가격이 이미 스탑을 넘었다고 가정), reduceOnly market 청산은 정상
+    체결되는 상황을 흉내낸다(2026-08-11 사고②, 2026-07-27 실측 패턴)."""
+
+    def __init__(self, current_price, market_id="ETHUSDT"):
+        self.current_price = current_price
+        self._market_id = market_id
+        self.create_order_calls: list[dict] = []
+
+    def load_markets(self):
+        pass
+
+    def market(self, symbol):
+        return {"id": self._market_id}
+
+    def fapiPrivateGetOpenAlgoOrders(self):
+        return []
+
+    def fetch_ticker(self, symbol):
+        return {"last": self.current_price}
+
+    def create_order(self, symbol, order_type, side, qty, price=None, params=None):
+        self.create_order_calls.append({"order_type": order_type, "side": side, "qty": qty, "params": params})
+        if order_type == "STOP_MARKET":
+            raise ccxt.OrderImmediatelyFillable("binanceusdm Order would immediately trigger.")
+        return {"id": "CLOSE1", "status": "closed", "filled": qty, "average": self.current_price}
+
+
+def test_ensure_stop_placed_closes_immediately_when_stop_already_breached(db_path, monkeypatch):
+    """경계: 거래소가 -2021로 거부하고 실제로 현재가가 스탑 조건을 이미
+    충족했으면(레이스에서 짐), 같은 가격으로 계속 재시도하는 대신 즉시
+    reduceOnly 시장가로 청산한다 - 대기하는 스탑은 어차피 계속 거부당할
+    뿐이므로(2026-07-27 실측: 5회 그룹 반복해도 전부 동일 거부)."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    # 롱 포지션의 sell 스탑(1907) - 현재가(1900)가 이미 그 이하 아님... 손절 조건은
+    # "가격이 스탑 이하로 떨어지면"이므로 현재가를 스탑 아래로 설정해 조건 충족을 재현.
+    exchange = _RaceConditionStubExchange(current_price=1900.0)
+    position = SimpleNamespace(direction="long", qty=1.5, current_stop=1907.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "ETH/USDT:USDT", position)
+
+    assert result.stop_confirmed is False
+    assert result.closed_instead is True
+    assert result.close_result.status == "filled"
+    assert [c["order_type"] for c in exchange.create_order_calls] == ["STOP_MARKET", "market"]
+    assert exchange.create_order_calls[1]["side"] == "sell"  # 롱 청산이므로 매도
+    assert exchange.create_order_calls[1]["params"] == {"reduceOnly": True}
+
+
+def test_ensure_stop_placed_keeps_retrying_when_price_not_actually_breached(db_path, monkeypatch):
+    """실패(대체청산 안 함): -2021을 받았어도 실제 현재가로 재확인했을 때
+    조건이 아직 안 충족됐으면(예: 순간적 API 오류 등 다른 원인) 함부로
+    청산하지 않고 기존 재시도 흐름을 그대로 유지한다 - 안전 쪽으로만
+    행동을 확장했는지 확인."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    # 롱 포지션 sell 스탑(1907)인데 현재가(1950)는 스탑보다 훨씬 위 - 조건 미충족
+    exchange = _RaceConditionStubExchange(current_price=1950.0)
+    position = SimpleNamespace(direction="long", qty=1.5, current_stop=1907.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "ETH/USDT:USDT", position, max_retries=2)
+
+    assert result.stop_confirmed is False
+    assert result.closed_instead is False
+    # market 청산 시도 없이 STOP_MARKET만 max_retries번 재시도했어야 함
+    assert [c["order_type"] for c in exchange.create_order_calls] == ["STOP_MARKET", "STOP_MARKET"]
+
+
+# =====================================================================
+# cancel_stop_orders — 2026-08-11 발견(고아 스탑): 포지션 완전청산 후에도
+# STOP_MARKET이 거래소에 남아있던 실측 사례(ETH, trigger=1910.35) 대응
+# =====================================================================
+
+class _AlgoOrdersStubExchange:
+    def __init__(self, algo_orders, market_id="ETHUSDT"):
+        self._algo_orders = list(algo_orders)
+        self._market_id = market_id
+        self.deleted_algo_ids: list = []
+
+    def market(self, symbol):
+        return {"id": self._market_id}
+
+    def fapiPrivateGetOpenAlgoOrders(self):
+        return list(self._algo_orders)
+
+    def fapiPrivateDeleteAlgoOrder(self, params):
+        self.deleted_algo_ids.append(params["algoId"])
+
+
+def test_cancel_stop_orders_cancels_all_new_stops_for_symbol():
+    """정상: 해당 심볼의 NEW 상태 알고 스탑을 전부 취소하고, 다른 심볼은
+    건드리지 않는다."""
+    exchange = _AlgoOrdersStubExchange(algo_orders=[
+        {"symbol": "ETHUSDT", "algoId": 1, "algoStatus": "NEW"},
+        {"symbol": "ETHUSDT", "algoId": 2, "algoStatus": "NEW"},
+        {"symbol": "BTCUSDT", "algoId": 3, "algoStatus": "NEW"},
+    ])
+
+    cancelled = executor.cancel_stop_orders(exchange, "ETH/USDT:USDT")
+
+    assert cancelled == 2
+    assert set(exchange.deleted_algo_ids) == {1, 2}
+
+
+def test_cancel_stop_orders_skips_non_new_status():
+    """경계: 이미 트리거됐거나 취소된 상태는 다시 취소 시도하지 않는다."""
+    exchange = _AlgoOrdersStubExchange(algo_orders=[
+        {"symbol": "ETHUSDT", "algoId": 1, "algoStatus": "TRIGGERED"},
+    ])
+
+    cancelled = executor.cancel_stop_orders(exchange, "ETH/USDT:USDT")
+
+    assert cancelled == 0
+    assert exchange.deleted_algo_ids == []
+
+
+def test_cancel_stop_orders_continues_after_individual_failure(capsys):
+    """실패: 개별 취소가 실패해도 나머지는 계속 시도하고, 실패를 조용히
+    삼키지 않는다(CLAUDE.md 원칙)."""
+    class _FlakyExchange(_AlgoOrdersStubExchange):
+        def fapiPrivateDeleteAlgoOrder(self, params):
+            if params["algoId"] == 1:
+                raise RuntimeError("boom")
+            super().fapiPrivateDeleteAlgoOrder(params)
+
+    exchange = _FlakyExchange(algo_orders=[
+        {"symbol": "ETHUSDT", "algoId": 1, "algoStatus": "NEW"},
+        {"symbol": "ETHUSDT", "algoId": 2, "algoStatus": "NEW"},
+    ])
+
+    cancelled = executor.cancel_stop_orders(exchange, "ETH/USDT:USDT")
+
+    assert cancelled == 1
+    assert exchange.deleted_algo_ids == [2]
+    captured = capsys.readouterr()
+    assert "취소 실패" in captured.err
 
 
 # =====================================================================

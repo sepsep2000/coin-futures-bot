@@ -170,7 +170,8 @@ def test_tick_ensure_stop_sweep_runs_before_2a_and_filtered_trend(db_path, monke
     calls: list[str] = []
 
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
-                         lambda exchange, db, symbol, position, max_retries=3: calls.append(f"ensure_stop:{symbol}") or True)
+                         lambda exchange, db, symbol, position, max_retries=3: calls.append(f"ensure_stop:{symbol}")
+                         or SimpleNamespace(stop_confirmed=True, closed_instead=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 10000.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: True)
     monkeypatch.setattr(scheduler, "_process_2a_rebalance",
@@ -185,7 +186,8 @@ def test_tick_ensure_stop_sweep_runs_before_2a_and_filtered_trend(db_path, monke
 
 def test_tick_non_rebalance_boundary_skips_2a(db_path, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed", lambda *a, **k: True)
+    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 10000.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: False)
     monkeypatch.setattr(scheduler, "_process_2a_rebalance",
@@ -203,7 +205,8 @@ def test_tick_daily_loss_limit_breach_blocks_entries_but_still_processes(db_path
     하므로 _process_filtered_trend_tick 자체는 호출되되 blocked=True로
     전달돼야 한다(그 함수 내부가 신규진입만 건너뜀)."""
     calls: list[str] = []
-    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed", lambda *a, **k: True)
+    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (-500.0, 10000.0))
     monkeypatch.setattr(scheduler, "_handle_daily_loss_limit_breach",
                          lambda db, ex, pnl, eq, ts, pct: calls.append("breach_handled"))
@@ -227,7 +230,8 @@ def test_tick_continues_when_ensure_stop_placed_fails(db_path, monkeypatch):
     calls: list[str] = []
 
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
-                         lambda *a, **k: calls.append("ensure_stop_failed") or False)
+                         lambda *a, **k: calls.append("ensure_stop_failed")
+                         or SimpleNamespace(stop_confirmed=False, closed_instead=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 10000.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: False)
     monkeypatch.setattr(scheduler, "_process_filtered_trend_tick",
@@ -239,7 +243,8 @@ def test_tick_continues_when_ensure_stop_placed_fails(db_path, monkeypatch):
 
 
 def test_tick_saves_equity_snapshot(db_path, monkeypatch):
-    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed", lambda *a, **k: True)
+    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 12345.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: False)
     monkeypatch.setattr(scheduler, "_process_filtered_trend_tick", lambda *a, **k: None)
@@ -348,15 +353,20 @@ class _StubMarketOrderExchange:
         # 직접 지정할 수 있어야 한다(기본값은 빈 리스트 - 명시적으로 지정 안 하면
         # 실측상 포지션 없음으로 취급, DB만 보고 청산하던 예전 동작을 그대로 재현하지 않음).
         self._real_positions = real_positions if real_positions is not None else []
+        self.deleted_algo_ids: list = []
 
     def fetch_positions(self):
         return list(self._real_positions)
+
+    def fapiPrivateDeleteAlgoOrder(self, params):
+        self.deleted_algo_ids.append(params["algoId"])
+        self._algo_orders = [o for o in self._algo_orders if o.get("algoId") != params["algoId"]]
 
     def create_order(self, symbol, order_type, side, qty, price=None, params=None):
         if order_type == "STOP_MARKET":
             self._algo_orders.append({
                 "symbol": symbol.replace("/", "").split(":")[0], "orderType": "STOP_MARKET",
-                "side": side.upper(), "algoStatus": "NEW",
+                "side": side.upper(), "algoStatus": "NEW", "algoId": f"ALGO{len(self._algo_orders) + 1}",
             })
             return {"id": f"STOP{len(self._algo_orders)}"}
         self.calls.append({"symbol": symbol, "side": side, "qty": qty, "reduceOnly": (params or {}).get("reduceOnly")})
@@ -427,6 +437,70 @@ def test_manage_open_position_stop_loss_full_fill_deletes_position(db_path, monk
     assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": 1.0, "reduceOnly": None}]
     assert len(sent) == 1
     assert sent[0]["price"] == 94.5  # 시뮬레이션 가격이 아니라 실제 체결가 보고
+
+
+def test_manage_open_position_full_close_cancels_orphan_stop_orders(db_path, monkeypatch):
+    """★ 2026-08-11 발견 회귀 테스트: 포지션이 완전청산되면 그 심볼에
+    남아있는 알고 스탑도 같이 취소돼야 한다 - 실측(ETH, trigger=1910.35)으로
+    확인된 고아 스탑 방치 버그 재발 방지."""
+    save_position(db_path, scheduler.FT_SYMBOL, "filtered_trend", "long", 1.0, 100.0,
+                   "2026-07-01T00:00:00+00:00", 95.0, initial_stop=95.0, entry_fee_usd=0.05,
+                   funding_paid_usd=0.0, partial_taken=False)
+    pos = load_open_positions(db_path, strategy="filtered_trend")[0]
+
+    trend_cfg = {**TREND_CFG, "stop_grace_period_bars": 0}
+    df_15m = _make_df_15m(low_last=90.0)
+    latest_bar = df_15m.iloc[-1]
+    ts = df_15m.index[-1]
+
+    exchange = _StubMarketOrderExchange(fill_price=94.5)
+    exchange._algo_orders.append({
+        "symbol": scheduler.FT_SYMBOL.replace("/", "").split(":")[0], "orderType": "STOP_MARKET",
+        "side": "SELL", "algoStatus": "NEW", "algoId": "PRE_EXISTING_STOP",
+    })
+    monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **kw: True)
+
+    scheduler._manage_open_filtered_trend_position(
+        db_path, exchange, pos, df_15m, df_15m, _empty_funding_df(),
+        trend_cfg, COST_CFG, ts, latest_bar, total_equity=10000.0, account_cfg={"initial_equity_usd": 10000},
+    )
+
+    assert exchange.deleted_algo_ids == ["PRE_EXISTING_STOP"]
+
+
+# =====================================================================
+# _handle_stop_result — 2026-08-11 사고② 대응(스탑 대신 즉시청산된 경우
+# 호출부가 반드시 DB/알림을 정리해야 함)
+# =====================================================================
+
+def test_handle_stop_result_noop_when_stop_confirmed(db_path, monkeypatch):
+    """정상: 스탑이 정상 배치됐으면(closed_instead=False) 아무 것도 안 한다."""
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "t", 2900.0)
+    sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    scheduler._handle_stop_result(db_path, "ETH/USDT:USDT", "filtered_trend", "long",
+                                   SimpleNamespace(stop_confirmed=True, closed_instead=False))
+
+    assert load_open_positions(db_path, strategy="filtered_trend") != []  # 그대로 유지
+    assert sent == []
+
+
+def test_handle_stop_result_deletes_position_and_alerts_when_closed_instead(db_path, monkeypatch):
+    """경계: closed_instead=True면 DB 포지션을 지우고 CRITICAL로 알린다 -
+    거래소는 이미 닫혔는데 DB만 열려있는 상태로 남으면 다음 틱에 혼란을
+    일으킨다(이 프로젝트가 반복 지적한 로컬-실측 불일치 패턴)."""
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "t", 2900.0)
+    sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+    close_result = SimpleNamespace(status="filled", filled_qty=1.0, avg_fill_price=2895.0)
+
+    scheduler._handle_stop_result(db_path, "ETH/USDT:USDT", "filtered_trend", "long",
+                                   SimpleNamespace(stop_confirmed=False, closed_instead=True, close_result=close_result))
+
+    assert load_open_positions(db_path, strategy="filtered_trend") == []
+    assert len(sent) == 1
+    assert "즉시청산" in sent[0]
 
 
 def test_manage_open_position_close_order_fails_keeps_position_and_alerts(db_path, monkeypatch):
@@ -821,7 +895,8 @@ def test_process_filtered_trend_tick_logs_attempt_before_placing_order(db_path, 
     monkeypatch.setattr(scheduler, "position_size", lambda *a, **k: 1.0)
     monkeypatch.setattr(scheduler.executor, "place_order",
                          lambda *a, **k: SimpleNamespace(status="filled", avg_fill_price=100.0))
-    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
     monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **k: True)
 
     scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
@@ -829,3 +904,37 @@ def test_process_filtered_trend_tick_logs_attempt_before_placing_order(db_path, 
     captured = capsys.readouterr()
     assert "qty=1.0 - 주문 시도" in captured.err
     assert load_open_positions(db_path, strategy="filtered_trend") != []  # 실제로 진입까지 됐는지도 같이 확인
+
+
+def test_process_filtered_trend_tick_deletes_position_and_skips_entry_notification_when_stop_closes_instead(
+    db_path, _stub_data_layer, monkeypatch,
+):
+    """★ 2026-08-11 사고② 회귀: 진입 직후 스탑 조건이 이미 충족돼 즉시
+    청산된 경우, 방금 저장한 진입 상태가 DB에 남아있으면 안 되고
+    (거래소엔 이미 포지션이 없음), 정상 진입인 것처럼 entry 알림을 보내면
+    안 된다(포지션이 이미 없는데 "진입했다"고 알리는 건 오해를 부름)."""
+    ts = _stub_data_layer
+    monkeypatch.setattr(scheduler, "classify_regime", lambda df, cfg: pd.Series("TREND", index=df.index))
+    monkeypatch.setattr(scheduler, "generate_trend_signals", lambda df, cfg: pd.DataFrame(
+        {"entry_long": True, "entry_short": False, "initial_stop_long": 90.0, "initial_stop_short": 110.0},
+        index=df.index,
+    ))
+    monkeypatch.setattr(scheduler, "_momentum_agrees", lambda direction, roc: True)
+    monkeypatch.setattr(scheduler, "_qty_step_and_min", lambda exchange, symbol: (0.001, 0.001))
+    monkeypatch.setattr(scheduler, "position_size", lambda *a, **k: 1.0)
+    monkeypatch.setattr(scheduler.executor, "place_order",
+                         lambda *a, **k: SimpleNamespace(status="filled", avg_fill_price=100.0))
+    close_result = SimpleNamespace(status="filled", filled_qty=1.0, avg_fill_price=89.5)
+    monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=False, closed_instead=True,
+                                                          close_result=close_result))
+    entry_sent = []
+    critical_sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **k: entry_sent.append(k) or True)
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: critical_sent.append(msg) or True)
+
+    scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
+
+    assert load_open_positions(db_path, strategy="filtered_trend") == []  # 방금 저장한 진입이 다시 삭제됨
+    assert entry_sent == []  # 정상 진입 알림은 안 나감
+    assert len(critical_sent) == 1
