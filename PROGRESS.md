@@ -1,5 +1,72 @@
 # PROGRESS.md
 
+## 2026-08-11 — 스탑배치 근본원인 2건 수정 + 고아스탑 정리 + 2a 조기청산 사고 대응
+
+**배경**: G4 시작 이후 filtered_trend ETH 스탑 배치 실패가 3사이클 연속
+발생(7/26~27, 7/27 재진입, 8/10). 사용자 승인 하에 근본원인 조사 진행.
+
+**조사 결과 — 실제로는 서로 다른 버그 2개**(사용자가 "같은 계열"로
+추정했던 것과 달리):
+- **근본원인 A(사고③, 8/10 신규진입)**: `ensure_stop_placed()`에 넘기는
+  스탑가격이 pandas 계산값(`numpy.float64`)일 때 ccxt의
+  `safe_string_2`가 이를 None으로 처리해 "requires a triggerPrice"로
+  거부됨 — 직접 재현 확인(native float는 정상, numpy.float64는 실패).
+  DB에서 재로드한 값(SQLite REAL→native float)은 문제없어서 신규진입
+  직후 경로에서만 발생.
+- **근본원인 B(사고②, 7/27 재진입)**: `OrderImmediatelyFillable`(-2021)로
+  거래소가 거부하면 재시도가 **똑같은 스탑가격으로 재시도**해 가격이
+  이미 그 레벨을 넘었으면 항상 같은 결과. 사고①(7/26~27 반복매도)은
+  이 둘과 무관한 별개 버그(`avg_fill_price` None → TypeError, 이미
+  7/27에 수정됨) — 사용자의 최초 분류를 정정.
+- **부가 발견**: 포지션 완전청산 시 알고 스탑을 취소하는 코드가 없어
+  고아 스탑이 계속 쌓임(실측: ETH 완전청산 후에도 trigger=1910.35 스탑
+  잔존).
+
+**수정**: [src/live/executor.py](src/live/executor.py) `ensure_stop_placed()`
+- A: stopPrice를 `float()`로 명시 캐스팅
+- B: `-2021` 캐치 시 현재가 재조회 → 스탑조건 실제로 충족됐으면
+  reduceOnly 시장가로 즉시청산(대기하는 스탑 대신)
+- 반환 타입을 `bool`→`StopPlacementResult`(stop_confirmed/closed_instead/
+  close_result)로 확장, 호출부(scheduler.py) 4곳 전부 업데이트
+- 신규 `cancel_stop_orders()`: 포지션 완전청산 시 잔여 알고스탑 정리
+- scheduler.py에 공유 헬퍼 `_handle_stop_result()` 추가 — closed_instead
+  시 DB 삭제 + CRITICAL 알림(로컬-실측 불일치 재발 방지)
+
+**⚠️ 검증 중 사고 발생**: 통합테스트(`pytest -m integration`) 실행 중
+`test_real_testnet_2a_rebalance_bounded_cycle`이 실계좌에 진짜 리밸런스를
+일으켜, 당시 보유 중이던 2a 8개 포지션이 전부 조기청산됨(순손익
++$35.16, 원인/재발방지 상세: [reports/G4_2A_ACCIDENTAL_LIQUIDATION_20260811.md](reports/G4_2A_ACCIDENTAL_LIQUIDATION_20260811.md)).
+버그가 아니라 Claude가 통합테스트의 실계좌 영향을 사전 확인 없이 실행한
+운영 실수. 실계좌에 영향 주는 통합테스트 4건을 식별해 문서화, 향후
+포지션 보유 중에는 사전 승인 없이 실행 금지 원칙 수립. 이번 2a 청산은
+30건 판정 대상에서 제외. 8/16 다음 정기 리밸런스까지 의도적 무포지션
+유지 — 임의 재진입 없음.
+
+**재가동 시 추가 발견**: `recover_state()`가 로컬 DB(2a 8건 잔존)와
+거래소 실측(0건)의 불일치를 정확히 감지해 자동 시작을 거부함(설계대로
+정상 작동 — 안전장치가 실제로 작동한 사례). 거래소 실측이 진실이므로
+로컬 DB의 stale 2a 포지션 8건을 삭제해 재조정 후 정상 기동.
+
+**테스트**: 신규 13개(executor: numpy캐스팅 회귀 1, -2021 즉시청산 경계 1,
+가격 미충족시 유지 실패케이스 1, cancel_stop_orders 정상/경계/실패 3 /
+scheduler: 고아스탑 정리 연동 1, _handle_stop_result 정상/경계 2,
+entry-path closed_instead 처리 1) + 기존 7개 반환타입 변경 대응.
+`tests/ -x -q` 325/325 통과(Windows/WSL 양쪽, unit only — 실계좌 영향
+통합테스트는 이번엔 의도적으로 미실행).
+
+**재가동 확인**: PID 379, 첫 틱 13:10:19 UTC 정상 완료(에러 없음, 신규
+진단로깅 정상 작동 확인). 텔레그램 정상 재개 알림 발송(사고 경위 포함).
+최종 계좌: 포지션 0건(의도됨), 미체결주문 0건, 고아스탑 0건, USDT
+$5,211.78.
+
+**미해결**:
+- Windows 작업 스케줄러(RSIB_*)는 여전히 비정상(LastTaskResult=1,
+  S4U 로그온 권한 문제) — 이번 세션 권한으로는 수정 불가, 데스크탑에서
+  관리자 권한 확인 필요(기존 미해결 항목 유지).
+- `test_live_executor_integration.py::test_real_testnet_place_poll_cancel_and_cleanup`
+  의 정리 assertion(`open_qty == 0`)이 계좌 전체 포지션을 합산해 다른
+  보유 포지션이 있으면 오탐 가능 — 이번엔 발견만, 수정은 범위 밖.
+
 ## 2026-08-01 — filtered_trend 신규진입 "조용한 스킵" 발견 + 진단 로깅 추가
 
 **배경**: 사용자가 "ETH 매수가 한 번도 없는 것 같다"고 지적. 확인 결과 봇
