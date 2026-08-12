@@ -1,5 +1,27 @@
 # PROGRESS.md
 
+## 2026-08-12 (이어서) — 청산 경로 전수조사 + reduceOnly/실측확인 일괄 적용
+
+ETH phantom long 사고(직전 기록) 원인과 같은 패턴이 다른 청산 경로에도
+있는지 전수조사(사용자 승인). `src/` 전체에서 `place_order` 호출 지점
+6곳 확인 — 킬스위치·ensure_stop_placed 대체청산은 이미 정상(대조군),
+**2a 리밸런스 청산·filtered_trend 관리 청산 2곳에서 동일 결함 확인**
+(거래소 실측 확인 없음, reduceOnly 없음).
+
+**수정**: `scheduler.py`에 `_verify_and_cap_close_qty()` 신설 - 청산 전
+`fetch_positions()`로 실제 존재/수량 확인, 없으면 주문 스킵하고 DB만
+정리, 있으면 실측 수량으로 캡핑 후 reduceOnly 청산. 2a·filtered_trend
+양쪽 청산 경로에 적용, `cancel_stop_orders`도 2a에 새로 연동.
+
+**테스트**: 신규 8개(정상/경계/실패 + 양쪽 경로 사고재현 회귀) + 기존
+3개 스텁 보정. `tests/ -x -q` 332/332 통과(Windows/WSL 양쪽).
+
+**재가동**: 일시정지 → 적용 → 테스트 통과 → 재시작(PID 4618, 정상) →
+거래소 실측 재확인(2a 8개 포지션·8개 스탑 무변경, filtered_trend
+무포지션, 미체결 0건) — 전 과정 실거래 영향 없음.
+
+상세: reports/G4_ETH_MANAGEMENT_PHANTOM_LONG_20260811.md 7절.
+
 ## 2026-08-12 — filtered_trend 관리 경로 오작동: 청산이 신규진입으로 뒤집힌 사고
 
 사용자가 XMR -10.5%를 물어봐서 조사(실제로는 20배 레버리지 표시 착시,

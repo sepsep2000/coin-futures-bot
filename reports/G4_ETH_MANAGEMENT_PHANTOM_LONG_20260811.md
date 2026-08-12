@@ -80,12 +80,55 @@ result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, close_direction
 3. 청산 후 `fetch_positions()` 재확인 — ETH 잔여 포지션 0건, 2a 8개
    포지션 전부 무영향 확인, 미체결 주문 0건
 
-## 7. 미해결 (코드 수정은 이번 범위 밖 — 문서화만 요청받음)
+## 7. 근본수정 (2026-08-12, 사용자 승인)
 
-- `_manage_open_filtered_trend_position()`의 청산 주문에 `reduceOnly=True`
-  적용 필요(사고②/B 수정과 동일 원칙).
-- 이상적으로는 청산 주문 제출 **전에** 거래소 실측으로 포지션이 실제로
-  존재하는지 먼저 확인하는 방어 로직 추가 검토.
-- 이 문제가 2a의 청산 경로([src/live/scheduler.py:369-374](src/live/scheduler.py:369))
-  에도 동일하게 존재하는지는 아직 확인 안 함(2a도 `reduceOnly` 없이
-  `place_order`만 호출) — 다음 조사 대상 후보.
+### 7.1 전수조사 결과
+
+`src/`에서 `place_order`/`create_order`를 호출하는 모든 지점을 전수조사
+(청산성 주문만 대상, 신규진입 경로는 의도적으로 제외):
+
+| 호출부 | 성격 | 수정 전 상태 | 조치 |
+|---|---|---|---|
+| `executor.py::ensure_stop_placed` 내 대체청산(353행) | 청산 | 실측 확인 O, reduceOnly O | 대조군 — 2026-08-11 오전 이미 수정 완료, 무변경 |
+| `scheduler.py::_execute_kill_switch_liquidation`(194행) | 청산 | 실측 확인 O, reduceOnly O | 대조군 — 2026-07-27 킬스위치 사고 이후 이미 정상, 무변경 |
+| `scheduler.py::_process_2a_rebalance` 청산 단계(372행) | 청산 | **실측 확인 X, reduceOnly X** | **수정** |
+| `scheduler.py::_process_2a_rebalance` 신규진입 단계(386행) | 진입 | 해당없음(진입이라 원래 reduceOnly 없어야 함) | 무변경 |
+| `scheduler.py::_process_filtered_trend_tick` 신규진입(532행) | 진입 | 해당없음 | 무변경 |
+| `scheduler.py::_manage_open_filtered_trend_position` 청산(593행, 이번 사고 원인) | 청산 | **실측 확인 X, reduceOnly X** | **수정** |
+
+결론: 청산성 호출 4곳 중 2곳(킬스위치, ensure_stop_placed 대체청산)은
+이미 이전 사고 대응으로 정상이었고, **정상 관리 경로 2곳(2a 리밸런스
+청산, filtered_trend 포지션 관리 청산)에서 동일 결함이 확인됨** — 이번
+ETH 사고가 국지적 버그가 아니라 실제로 "청산 주문을 내는 경로 전반에
+반복되던 설계 공백"이었음이 확인됨.
+
+### 7.2 수정 내용
+
+[src/live/scheduler.py](src/live/scheduler.py)에 공용 안전장치
+`_verify_and_cap_close_qty()` 신설 — 청산 주문 제출 전 `fetch_positions()`
+로 거래소 실측을 확인해:
+- 거래소에 해당 방향 포지션이 없으면(이미 청산됨) `0.0` 반환 → 호출부는
+  주문 없이 DB만 정리(`delete_position` + `cancel_stop_orders`)
+- 있으면 `min(요청 수량, 실측 수량)` 반환 → 부분적으로만 남아있는
+  경우에도 초과분이 신규진입으로 새지 않게 캡핑
+- 실측에서 확인된 수량으로 `reduceOnly=True` 청산 주문 제출
+
+`_process_2a_rebalance`(청산 단계)와 `_manage_open_filtered_trend_position`
+양쪽에 동일하게 적용, `cancel_stop_orders`도 2a 청산 경로에 새로 연동
+(기존엔 filtered_trend 완전청산 시에만 있었음 - 2a도 같은 고아스탑
+위험이 있어 함께 정리).
+
+### 7.3 테스트
+
+신규 8개: `_verify_and_cap_close_qty` 정상/경계(방향반전)/경계(수량캡핑)/
+실패(포지션없음) 4개, filtered_trend 관리경로 사고재현 회귀 1개, 2a
+청산경로 사고재현 회귀 1개 + 정상경로 회귀 1개, 기존 3개 테스트 스텁
+보정(`real_positions` 명시). `tests/ -x -q` 332/332 통과(Windows/WSL
+양쪽).
+
+### 7.4 재가동
+
+일시정지(PID 393 종료) → 코드 적용 → 테스트 통과 → 재시작(PID 4618,
+`recover_state` 정합성 통과, 첫 틱 10:43:02 UTC 정상) → 거래소 실측
+재확인: 2a 8개 포지션·8개 알고스탑 전부 무변경, filtered_trend 무포지션,
+미체결주문 0건.
