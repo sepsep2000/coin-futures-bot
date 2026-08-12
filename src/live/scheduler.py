@@ -241,6 +241,34 @@ def _handle_stop_result(db_path: Path, symbol: str, strategy: str, direction: st
     )
 
 
+def _verify_and_cap_close_qty(exec_exchange, symbol: str, expected_direction: str, requested_qty: float) -> float:
+    """★ 2026-08-11 ETH phantom long 사고 대응(reports/G4_ETH_MANAGEMENT_
+    PHANTOM_LONG_20260811.md): 청산 주문을 내기 "전에" 거래소 실측으로
+    실제 청산 가능한 수량을 확인한다 - DB만 믿고 청산 주문을 내면, 그
+    사이 거래소 스탑이 이미 포지션을 정리해버린 경우 청산이 아니라
+    신규진입이 돼버린다(로컬 상태 vs 거래소 실측 불일치 패턴, 2026-07-27
+    킬스위치 사고와 같은 계열).
+
+    - 거래소에 해당 심볼 포지션이 아예 없거나 방향이 다르면(이미
+      청산됐거나 반전됐음) 0.0을 반환 - 호출부는 주문을 내지 않고 DB만
+      정리해야 한다는 신호.
+    - 있으면 min(요청 수량, 실제 보유 수량)을 반환 - 부분청산 요청이
+      실제 보유량보다 많아지는 경우(예: 거래소 자동 스탑이 이미 일부를
+      먼저 정리한 경우)에도 초과분이 신규진입으로 새지 않게 한다."""
+    real_positions = [
+        p for p in exec_exchange.fetch_positions()
+        if p.get("symbol") == symbol and p.get("contracts") and float(p["contracts"]) != 0
+    ]
+    if not real_positions:
+        return 0.0
+    p = real_positions[0]
+    real_direction = "long" if p.get("side") == "long" else "short"
+    if real_direction != expected_direction:
+        return 0.0
+    real_qty = abs(float(p["contracts"]))
+    return min(requested_qty, real_qty)
+
+
 def _tick(cfg: dict, db_path: Path, data_exchange, exec_exchange, ts: pd.Timestamp) -> None:
     """15m 틱 1회 처리 — 순서는 모듈 docstring 및
     reports/REBALANCE_ORDER_ANALYSIS.md 3절 확정 순서 그대로."""
@@ -368,10 +396,17 @@ def _process_2a_rebalance(cfg: dict, db_path: Path, data_exchange, exec_exchange
     # --- 1단계: 청산 전부 ---
     for symbol in sorted(exited_long | exited_short):
         pos = next(p for p in current_positions if p["symbol"] == symbol)
+        capped_qty = _verify_and_cap_close_qty(exec_exchange, symbol, pos["direction"], pos["qty"])
+        if capped_qty <= 0:
+            _log_stderr(f"2a 리밸런스({ts}): {symbol} 거래소에 이미 포지션 없음 - 청산 주문 스킵, DB만 정리")
+            live_state.delete_position(db_path, symbol, "2a")
+            executor.cancel_stop_orders(exec_exchange, symbol)
+            continue
         close_direction = "short" if pos["direction"] == "long" else "long"
-        result = executor.place_order(exec_exchange, db_path, symbol, close_direction, pos["qty"])
+        result = executor.place_order(exec_exchange, db_path, symbol, close_direction, capped_qty, reduce_only=True)
         if result.status == "filled":
             live_state.delete_position(db_path, symbol, "2a")
+            executor.cancel_stop_orders(exec_exchange, symbol)
 
     # --- 2단계: 신규진입 전부 ---
     for symbol, direction in [(s, "long") for s in sorted(new_long)] + [(s, "short") for s in sorted(new_short)]:
@@ -590,11 +625,29 @@ def _manage_open_filtered_trend_position(db_path: Path, exec_exchange, pos: dict
     close_direction = "short" if position.direction == "long" else "long"
     all_filled = True
     for trade in trades:
-        result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, close_direction, trade.qty)
+        # ★ 2026-08-11 ETH phantom long 사고 대응(reports/G4_ETH_MANAGEMENT_
+        # PHANTOM_LONG_20260811.md): DB만 믿고 청산 주문을 내면, 그 사이
+        # 거래소 스탑이 이미 포지션을 정리해버린 경우 이 "청산" 주문이
+        # 실제로는 신규진입이 돼버린다(실사고, 13시간 49분 무보호 롱 노출).
+        # 주문 전 반드시 거래소 실측으로 재확인·수량 보정한다.
+        capped_qty = _verify_and_cap_close_qty(exec_exchange, FT_SYMBOL, position.direction, trade.qty)
+        if capped_qty <= 0:
+            _log_stderr(
+                f"filtered_trend 관리({ts}): 거래소에 이미 포지션 없음({trade.exit_reason}) - "
+                f"청산 주문 스킵, DB 정리만"
+            )
+            telegram.send_critical_alert(
+                f"filtered_trend {FT_SYMBOL} 포지션이 DB엔 남아있었지만 거래소엔 이미 없었음"
+                f"(사유: {trade.exit_reason}) - 청산 주문 없이 상태만 정리함"
+            )
+            live_state.delete_position(db_path, FT_SYMBOL, "filtered_trend")
+            executor.cancel_stop_orders(exec_exchange, FT_SYMBOL)
+            return
+        result = executor.place_order(exec_exchange, db_path, FT_SYMBOL, close_direction, capped_qty, reduce_only=True)
         if result.status != "filled":
             all_filled = False
             telegram.send_critical_alert(
-                f"filtered_trend 청산 주문({trade.exit_reason}) 미체결 - 수동 확인 필요: {FT_SYMBOL} qty={trade.qty}"
+                f"filtered_trend 청산 주문({trade.exit_reason}) 미체결 - 수동 확인 필요: {FT_SYMBOL} qty={capped_qty}"
             )
             continue
         # 2026-07-27 사고 대응: market 주문의 create_order 응답이 average(체결평균가)를

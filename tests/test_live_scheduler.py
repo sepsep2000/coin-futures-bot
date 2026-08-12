@@ -424,7 +424,10 @@ def test_manage_open_position_stop_loss_full_fill_deletes_position(db_path, monk
     latest_bar = df_15m.iloc[-1]
     ts = df_15m.index[-1]
 
-    exchange = _StubMarketOrderExchange(fill_price=94.5)
+    # 2026-08-11 ETH phantom long 사고 대응 이후: 청산 전 거래소 실측을 먼저
+    # 확인하므로, 스텁도 "실제로 포지션이 존재한다"는 걸 명시해야 한다.
+    exchange = _StubMarketOrderExchange(fill_price=94.5,
+                                         real_positions=[{"symbol": scheduler.FT_SYMBOL, "contracts": 1.0, "side": "long"}])
     sent = []
     monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **kw: sent.append(kw) or True)
 
@@ -434,7 +437,7 @@ def test_manage_open_position_stop_loss_full_fill_deletes_position(db_path, monk
     )
 
     assert load_open_positions(db_path, strategy="filtered_trend") == []  # 실제 체결 -> 포지션 삭제
-    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": 1.0, "reduceOnly": None}]
+    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": 1.0, "reduceOnly": True}]
     assert len(sent) == 1
     assert sent[0]["price"] == 94.5  # 시뮬레이션 가격이 아니라 실제 체결가 보고
 
@@ -453,7 +456,8 @@ def test_manage_open_position_full_close_cancels_orphan_stop_orders(db_path, mon
     latest_bar = df_15m.iloc[-1]
     ts = df_15m.index[-1]
 
-    exchange = _StubMarketOrderExchange(fill_price=94.5)
+    exchange = _StubMarketOrderExchange(fill_price=94.5,
+                                         real_positions=[{"symbol": scheduler.FT_SYMBOL, "contracts": 1.0, "side": "long"}])
     exchange._algo_orders.append({
         "symbol": scheduler.FT_SYMBOL.replace("/", "").split(":")[0], "orderType": "STOP_MARKET",
         "side": "SELL", "algoStatus": "NEW", "algoId": "PRE_EXISTING_STOP",
@@ -503,6 +507,93 @@ def test_handle_stop_result_deletes_position_and_alerts_when_closed_instead(db_p
     assert "즉시청산" in sent[0]
 
 
+# =====================================================================
+# _verify_and_cap_close_qty — 2026-08-11 ETH phantom long 사고 대응
+# (reports/G4_ETH_MANAGEMENT_PHANTOM_LONG_20260811.md): 청산 주문 전
+# 거래소 실측을 먼저 확인하는 공용 안전장치
+# =====================================================================
+
+class _PositionsOnlyStubExchange:
+    def __init__(self, positions: list[dict]):
+        self._positions = positions
+
+    def fetch_positions(self):
+        return list(self._positions)
+
+
+def test_verify_and_cap_close_qty_returns_full_qty_when_position_matches():
+    """정상: 거래소에 요청 수량 이상이 있으면 요청한 수량 그대로 반환."""
+    exchange = _PositionsOnlyStubExchange([
+        {"symbol": "ETH/USDT:USDT", "contracts": 2.0, "side": "long"},
+    ])
+    capped = scheduler._verify_and_cap_close_qty(exchange, "ETH/USDT:USDT", "long", 1.0)
+    assert capped == 1.0
+
+
+def test_verify_and_cap_close_qty_returns_zero_when_exchange_has_nothing(db_path):
+    """★ 사고 재현 회귀: DB엔 포지션이 있다고 나오지만 거래소엔 이미 없는
+    경우(거래소 자동 스탑이 먼저 정리한 경우) - 0.0을 반환해 호출부가
+    청산 주문을 내지 않도록 한다. 이게 없어서 실제로 신규진입이 생겼었다."""
+    exchange = _PositionsOnlyStubExchange([])  # 거래소 실측: 아무 것도 없음
+    capped = scheduler._verify_and_cap_close_qty(exchange, "ETH/USDT:USDT", "short", 1.605)
+    assert capped == 0.0
+
+
+def test_verify_and_cap_close_qty_returns_zero_when_direction_reversed():
+    """경계: 거래소 포지션이 존재하지만 방향이 예상과 다르면(반전됐으면)
+    "청산 가능한 예상 포지션 없음"과 동일하게 0.0을 반환한다."""
+    exchange = _PositionsOnlyStubExchange([
+        {"symbol": "ETH/USDT:USDT", "contracts": 1.605, "side": "long"},
+    ])
+    capped = scheduler._verify_and_cap_close_qty(exchange, "ETH/USDT:USDT", "short", 1.605)
+    assert capped == 0.0
+
+
+def test_verify_and_cap_close_qty_caps_to_real_qty_when_smaller():
+    """경계: 거래소 실측 수량이 요청보다 적으면(부분적으로 이미 청산됨)
+    실측 수량으로 캡핑한다 - 요청 수량대로 냈다가 초과분이 신규진입으로
+    새는 것 방지."""
+    exchange = _PositionsOnlyStubExchange([
+        {"symbol": "ETH/USDT:USDT", "contracts": 0.5, "side": "long"},
+    ])
+    capped = scheduler._verify_and_cap_close_qty(exchange, "ETH/USDT:USDT", "long", 1.605)
+    assert capped == 0.5
+
+
+def test_manage_open_position_skips_order_and_cleans_db_when_exchange_already_flat(db_path, monkeypatch):
+    """★ 2026-08-11 사고 재현 회귀 테스트(filtered_trend 관리 경로):
+    DB엔 포지션이 열려있다고 기록돼 있는데 거래소엔 이미 없는 상태(거래소
+    스탑이 먼저 자동 청산함)에서 관리 함수가 호출되면, 청산 주문을 내지
+    않고(냈으면 신규진입이 됐을 것) DB만 정리해야 한다."""
+    save_position(db_path, scheduler.FT_SYMBOL, "filtered_trend", "short", 1.605, 100.0,
+                   "2026-07-01T00:00:00+00:00", 105.0, initial_stop=105.0, entry_fee_usd=1.19,
+                   funding_paid_usd=0.0, partial_taken=False)
+    pos = load_open_positions(db_path, strategy="filtered_trend")[0]
+
+    trend_cfg = {**TREND_CFG, "stop_grace_period_bars": 0}
+    # 숏 포지션의 고가 돌파로 stop_loss 트리거되게(가격 자체는 실측 확인
+    # 스킵 여부와 무관 - trades 리스트에 뭐라도 담겨야 새 검증 분기를 탄다)
+    df_15m = _make_df_15m(high_last=110.0)
+    latest_bar = df_15m.iloc[-1]
+    ts = df_15m.index[-1]
+
+    exchange = _StubMarketOrderExchange(fill_price=1900.0, real_positions=[])  # 거래소엔 이미 없음
+    critical_sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: critical_sent.append(msg) or True)
+    entry_exit_sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **kw: entry_exit_sent.append(kw) or True)
+
+    scheduler._manage_open_filtered_trend_position(
+        db_path, exchange, pos, df_15m, df_15m, _empty_funding_df(),
+        trend_cfg, COST_CFG, ts, latest_bar, total_equity=10000.0, account_cfg={"initial_equity_usd": 10000},
+    )
+
+    assert exchange.calls == []  # 청산(=신규진입으로 샐 뻔한) 주문 자체를 내지 않음
+    assert load_open_positions(db_path, strategy="filtered_trend") == []  # DB는 실측에 맞춰 정리됨
+    assert entry_exit_sent == []  # 정상 청산 알림은 안 나감(실제 청산이 아니므로)
+    assert len(critical_sent) == 1  # 대신 불일치를 CRITICAL로 알림
+
+
 def test_manage_open_position_close_order_fails_keeps_position_and_alerts(db_path, monkeypatch):
     """★ 요구된 실패 케이스: 청산 주문이 미체결이면 _manage_trend_position이
     계산한 "청산됐어야 할" 상태를 state에 반영하지 않는다(공허한 성공 금지)."""
@@ -516,7 +607,8 @@ def test_manage_open_position_close_order_fails_keeps_position_and_alerts(db_pat
     latest_bar = df_15m.iloc[-1]
     ts = df_15m.index[-1]
 
-    exchange = _StubMarketOrderExchange(always_fail=True)
+    exchange = _StubMarketOrderExchange(always_fail=True,
+                                         real_positions=[{"symbol": scheduler.FT_SYMBOL, "contracts": 1.0, "side": "long"}])
     critical_sent = []
     monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: critical_sent.append(msg) or True)
     entry_exit_sent = []
@@ -574,7 +666,8 @@ def test_manage_open_position_partial_tp_reduces_qty_and_moves_stop_to_breakeven
     latest_bar = df_15m.iloc[-1]
     ts = df_15m.index[-1]
 
-    exchange = _StubMarketOrderExchange(fill_price=107.6)
+    exchange = _StubMarketOrderExchange(fill_price=107.6,
+                                         real_positions=[{"symbol": scheduler.FT_SYMBOL, "contracts": 1.0, "side": "long"}])
     sent = []
     monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **kw: sent.append(kw) or True)
 
@@ -592,7 +685,7 @@ def test_manage_open_position_partial_tp_reduces_qty_and_moves_stop_to_breakeven
     # 있음(engine.py 로직 그대로) - 정확한 트레일 값을 손으로 재계산하는
     # 대신 "본전 이상으로만 움직인다"는 불변식을 확인한다.
     assert remaining[0]["current_stop"] >= 100.0
-    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": pytest.approx(0.25), "reduceOnly": None}]
+    assert exchange.calls == [{"symbol": scheduler.FT_SYMBOL, "side": "sell", "qty": pytest.approx(0.25), "reduceOnly": True}]
     assert len(sent) == 1
     assert sent[0]["price"] == 107.6
 
@@ -938,3 +1031,62 @@ def test_process_filtered_trend_tick_deletes_position_and_skips_entry_notificati
     assert load_open_positions(db_path, strategy="filtered_trend") == []  # 방금 저장한 진입이 다시 삭제됨
     assert entry_sent == []  # 정상 진입 알림은 안 나감
     assert len(critical_sent) == 1
+
+
+# =====================================================================
+# _process_2a_rebalance 청산 경로 — 2026-08-11 사고 재현 회귀(같은 계열
+# 결함이 2a 리밸런스 청산 경로에도 있었는지 확인)
+# =====================================================================
+
+def test_process_2a_rebalance_skips_exit_order_and_cleans_db_when_exchange_already_flat(db_path, monkeypatch):
+    """★ DB엔 2a 포지션이 있다고 기록돼 있는데 거래소엔 이미 없는 상태에서
+    리밸런스가 돌면, 청산 주문을 내지 않고(냈으면 신규진입으로 샐 뻔함)
+    DB만 정리해야 한다 - filtered_trend 관리 경로와 같은 안전장치가 2a
+    경로에도 적용됐는지 확인."""
+    save_position(db_path, "BTC/USDT:USDT", "2a", "long", 0.01, 60000.0, "2026-08-01T00:00:00+00:00", 42000.0)
+
+    monkeypatch.setattr(scheduler, "update_ohlcv_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "update_funding_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.strategy_2a, "run_live_step",
+                         lambda cfg, project_root, ts: {"long_group": set(), "short_group": set(),
+                                                          "weight": 0.0, "as_of": ts})
+
+    exchange = _StubMarketOrderExchange(real_positions=[])  # 거래소엔 이미 없음
+    cfg = {
+        "data": {"ohlcv_cache_dir": "data/ohlcv", "funding_cache_dir": "data/funding", "since": "2023-01-01T00:00:00Z"},
+        "portfolio": {"weights": {"2a": 0.15}},
+        "costs": {"slippage_pct": 0.03, "taker_fee_pct": 0.05},
+    }
+
+    scheduler._process_2a_rebalance(cfg, db_path, object(), exchange, pd.Timestamp("2026-08-16", tz="UTC"),
+                                     total_equity=10000.0, entries_blocked=False)
+
+    assert exchange.calls == []  # 청산(=신규진입으로 샐 뻔한) 주문 자체를 내지 않음
+    assert load_open_positions(db_path, strategy="2a") == []  # DB는 실측에 맞춰 정리됨
+
+
+def test_process_2a_rebalance_exit_order_uses_reduce_only(db_path, monkeypatch):
+    """정상: 거래소에 실제로 포지션이 있을 때는 그대로 reduceOnly 청산
+    주문을 낸다(기존 정상 경로가 안 깨졌는지 확인)."""
+    save_position(db_path, "BTC/USDT:USDT", "2a", "long", 0.01, 60000.0, "2026-08-01T00:00:00+00:00", 42000.0)
+
+    monkeypatch.setattr(scheduler, "update_ohlcv_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "update_funding_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.strategy_2a, "run_live_step",
+                         lambda cfg, project_root, ts: {"long_group": set(), "short_group": set(),
+                                                          "weight": 0.0, "as_of": ts})
+
+    exchange = _StubMarketOrderExchange(fill_price=60100.0, real_positions=[
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "long"},
+    ])
+    cfg = {
+        "data": {"ohlcv_cache_dir": "data/ohlcv", "funding_cache_dir": "data/funding", "since": "2023-01-01T00:00:00Z"},
+        "portfolio": {"weights": {"2a": 0.15}},
+        "costs": {"slippage_pct": 0.03, "taker_fee_pct": 0.05},
+    }
+
+    scheduler._process_2a_rebalance(cfg, db_path, object(), exchange, pd.Timestamp("2026-08-16", tz="UTC"),
+                                     total_equity=10000.0, entries_blocked=False)
+
+    assert exchange.calls == [{"symbol": "BTC/USDT:USDT", "side": "sell", "qty": 0.01, "reduceOnly": True}]
+    assert load_open_positions(db_path, strategy="2a") == []
