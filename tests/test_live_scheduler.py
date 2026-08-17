@@ -343,7 +343,8 @@ class _StubMarketOrderExchange:
     갖춰 스탑 스윕이 조용히(에러 로그 없이) 통과하게 한다 - 이 테스트의
     관심사는 청산 로직이지 스탑 배치 자체가 아니므로."""
 
-    def __init__(self, fill_price: float = 100.0, always_fail: bool = False, real_positions: list[dict] | None = None):
+    def __init__(self, fill_price: float = 100.0, always_fail: bool = False, real_positions: list[dict] | None = None,
+                 fetch_positions_raises: Exception | None = None):
         self.fill_price = fill_price
         self.always_fail = always_fail
         self.calls: list[dict] = []
@@ -354,8 +355,14 @@ class _StubMarketOrderExchange:
         # 실측상 포지션 없음으로 취급, DB만 보고 청산하던 예전 동작을 그대로 재현하지 않음).
         self._real_positions = real_positions if real_positions is not None else []
         self.deleted_algo_ids: list = []
+        # 2026-08-17 사고 대응(fetch_positions 자체가 실패하는 경우, 예: 거래소 API
+        # 장애) - 킬스위치가 이 실패에도 크래시하지 않는지 검증하려면 스텁이 조회
+        # 단계에서 예외를 던질 수 있어야 한다.
+        self._fetch_positions_raises = fetch_positions_raises
 
     def fetch_positions(self):
+        if self._fetch_positions_raises is not None:
+            raise self._fetch_positions_raises
         return list(self._real_positions)
 
     def fapiPrivateDeleteAlgoOrder(self, params):
@@ -827,6 +834,35 @@ def test_execute_kill_switch_liquidation_cleans_up_stale_db_only_records(db_path
 
     assert exchange.calls == []  # 청산할 실물이 없으므로 주문 자체를 내지 않음
     assert load_open_positions(db_path) == []  # stale 레코드는 삭제됨
+
+
+def test_execute_kill_switch_liquidation_survives_fetch_positions_failure(db_path, monkeypatch):
+    """★ 회귀 테스트(2026-08-17 사고 재현 방지) - 킬스위치 발동 원인 자체가
+    거래소 API 불안정인 경우, 청산 대상을 정하는 첫 조회(fetch_positions)도
+    같은 이유로 실패할 수 있다. 실측 확인: 이 조회에 예외처리가 없어서
+    -1007(RequestTimeout)이 그대로 run_live_loop까지 전파돼 프로세스
+    전체가 처리되지 않은 예외로 죽었다(청산 주문은 한 건도 안 나갔으므로
+    그 자체로 포지션 위험은 없었지만, 킬스위치가 크래시로 사라지는 건
+    방치와 같다). 이제는 이 조회 실패도 캐치해서 CRITICAL 알림을 보내고
+    예외 없이 깨끗하게 반환해야 한다 - 재시도 루프에 빠지지 않는다."""
+    save_position(db_path, "ETH/USDT:USDT", "filtered_trend", "long", 1.0, 3000.0, "2026-07-25T00:00:00Z", 2900.0)
+
+    exchange = _StubMarketOrderExchange(fetch_positions_raises=RuntimeError(
+        'binanceusdm {"code":-1007,"msg":"Timeout waiting for response from backend server. '
+        'Send status unknown; execution status unknown."}'
+    ))
+    sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
+
+    scheduler._execute_kill_switch_liquidation(db_path, exchange, consecutive_errors=5)  # 예외 없이 반환돼야 함
+
+    assert exchange.calls == []  # 조회부터 실패했으므로 청산 주문 자체가 시도되지 않음
+    # DB 포지션은 손대지 않고 그대로 남아있어야 한다(청산 성공한 것처럼 지우면 공허한 성공)
+    assert len(load_open_positions(db_path)) == 1
+    assert len(sent) == 1
+    assert "5회" in sent[0]
+    assert "청산 대상 조회 자체가 실패" in sent[0]
+    assert "수동" in sent[0]
 
 
 # =====================================================================

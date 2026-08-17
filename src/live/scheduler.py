@@ -174,11 +174,33 @@ def _execute_kill_switch_liquidation(db_path: Path, exec_exchange, consecutive_e
     안전장치 자신의 입력을 검증하지 않는" 결함이었다. 또한 방향 실수로
     같은 사고가 재발하는 것 자체를 막기 위해 reduce_only=True로 주문한다
     (거래소 레벨에서 포지션 반전/배증을 원천 차단, 7절 긴급 청산에서 실사용
-    검증됨)."""
-    real_positions = [
-        p for p in exec_exchange.fetch_positions()
-        if p.get("contracts") and float(p["contracts"]) != 0
-    ]
+    검증됨).
+
+    ★ 2026-08-17 사고 대응(실측 재현, Binance testnet -1007 장애 중):
+    연속오류 킬스위치가 발동한 원인 자체가 API 불안정인 경우, 바로 이
+    `fetch_positions()` 조회도 같은 이유로 실패할 수 있다 - 이 함수의
+    나머지 로직(각 place_order 실패 허용)은 이미 그 상황을 가정하고
+    설계됐는데, 정작 맨 처음 조회에는 그 원칙이 빠져 있어 여기서 예외가
+    나면 잡히지 않고 run_live_loop 전체가 크래시했다(실측 확인:
+    23:15 UTC 킬스위치 발동 시 fetch_positions()가 -1007로 실패, 그대로
+    전파돼 프로세스 사망). 청산 주문은 한 건도 시도되지 못한 채
+    죽었으므로 그 자체로는 안전했지만("아무 것도 안 함"이 최악은
+    아니었음), 킬스위치가 있어야 할 상황에서 조용히 사라지는 건 여전히
+    방치다 - 조회 실패도 명시적으로 잡아 CRITICAL로 알리고, 프로세스는
+    (재시도 루프에 빠지지 않고) 깨끗하게 정지한다."""
+    try:
+        real_positions = [
+            p for p in exec_exchange.fetch_positions()
+            if p.get("contracts") and float(p["contracts"]) != 0
+        ]
+    except Exception as exc:  # noqa: BLE001 - 킬스위치 자신도 조회 실패에 안전해야 함(위 사고 대응)
+        telegram.send_critical_alert(
+            f"연속오류 킬스위치 발동({consecutive_errors}회 연속 실패) - 봇 정지. "
+            f"청산 대상 조회 자체가 실패({type(exc).__name__}: {exc}) - 청산 시도 불가. "
+            f"거래소 실제 포지션/스탑 상태를 즉시 수동 확인해야 함."
+        )
+        return
+
     db_positions_by_symbol = {p["symbol"]: p for p in live_state.load_open_positions(db_path)}
 
     liquidated: list[str] = []
