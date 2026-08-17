@@ -1,5 +1,56 @@
 # PROGRESS.md
 
+## 2026-08-17 (이어서) — 사고/정상 실현PnL 자동 분리 시스템 구축
+
+지금까지 사고성 이벤트를 매번 수동으로 다시 정산하던 작업을 구조화
+(사용자 요청). `reports/incidents.yaml` 사고 이벤트 레지스트리(기간+
+심볼+pnl_impact 태그) + `src/live/incident_pnl.py`(순수 분류함수) +
+`scripts/daily_report.py` 통합으로, 앞으로 새 사고가 확정되면 레지스트리
+항목만 추가하면 자동 반영되게 만들었다.
+
+**등록된 사고 5건** (전부 저장된 사고 문서의 실측 타임스탬프 기준):
+1. `20260727_2a_killswitch_liquidation` — 2a 킬스위치 조기 강제청산 (2a 다리)
+2. `20260726_0727_filtered_trend_partial_exit_bug` — filtered_trend ETH 부분익절 반복+배증 (filtered_trend 다리)
+3. `20260811_2a_integration_test_liquidation` — 통합테스트 오청산+재진입
+4. `20260811_0812_eth_phantom_long` — filtered_trend 관리경로 오작동(청산→신규진입)
+5. `20260727_0728_parquet_cache_corruption` — parquet 손상(pnl_impact: false, 거래 영향 없음 확인됨, 문서화 목적으로만 등록)
+
+**개발 중 실측으로 발견한 매칭 버그 2건(둘 다 회귀 테스트로 고정)**:
+- 초기 설계는 `symbols` 빈 리스트를 "심볼 제한 없음"으로 해석해, parquet
+  사고(pnl_impact:false)의 넓은 7시간 시간창이 그 시간대 무관한 정상 ETH
+  거래(-$70.99)까지 전부 삼켜버림 — `symbols` 키 자체가 없으면(None)
+  "제한 없음", `symbols: []`(명시적 빈 리스트)는 "절대 매칭 안 함"으로
+  의미를 분리해 수정.
+- eth_phantom_long 사고의 시간창 시작을 거래소 자동 스탑 체결 시각
+  (19:31:32)과 같은 19:31:00으로 잡아, 그 직전의 **정상** 숏 진입→
+  스탑청산(-$22.84, 전략이 설계대로 작동한 정상 결과)까지 사고로 잘못
+  포함시킴 — start를 스탑 체결 1초 뒤(19:31:33)로 옮겨 정상 결과는
+  제외하고 오작동 롱(19:45~)부터만 사고로 분류하도록 수정.
+
+**재정산 결과 (G4 시작~현재, income 원장 grand_total $75.91 기준)**:
+- 사고분: **$158.07** (2a킬스위치 -$8.60 / filtered_trend배증 +$77.61 /
+  통합테스트오청산 +$34.48 / ETH phantom +$54.57 / parquet $0)
+- **순수 전략 수익: -$82.16**
+
+이 값은 직전 세션에서 채팅으로만 보고했던 "-$6.85"·"-$8.13"과 크게
+다르다 — 그 두 값은 저장되지 않은 수작업 분류(재현 불가)였고, 사후
+검증 결과 실제로는 사고분을 과소 산정하고 있었던 것으로 판단된다(특히
+filtered_trend 배증 사고의 펀딩비·전체 수수료가 누락됐을 가능성).
+이번 값은 `reports/incidents.yaml` + `src/live/incident_pnl.py`로
+완전히 재현 가능하며, 이후 이 자동화 시스템이 유일한 정산 소스가 된다.
+
+**테스트**: `tests/test_incident_pnl.py` 9개(분류 정상/경계 4개 - 반열림
+구간, 심볼 불일치, pnl_impact=false 처리, symbols=[] 매칭안됨 회귀 +
+매칭 0건 경고 + 빈 레지스트리 + 레지스트리 파일 로드 2개) +
+`tests/test_daily_report.py` 5개(리포트 3줄 포맷, 매칭0건 경고,
+build_report_text 통합, fetch_pnl_classification 정상/빈레지스트리
+경계). `tests/ -x -q` 350/350 통과.
+
+**실행 확인**: 실제 testnet 계좌로 `daily_report.fetch_pnl_classification`
++ `build_report_text` 실행(조회 전용, 주문/상태변경 없음) — 등록된 4개
+pnl_impact 사고 전부 매칭 확인(`unmatched_impact_incidents: []`), 리포트
+텍스트에 "[실현 PnL 정산 (G4 누적)]" 3줄 정상 표시 확인.
+
 ## 2026-08-17 — realized_pnl_usd 하드코딩 수정 + 과거 기록 보정 + 재정산
 
 `_process_2a_rebalance`가 청산 손익을 항상 `0.0`으로 하드코딩(주석: "실현손익
