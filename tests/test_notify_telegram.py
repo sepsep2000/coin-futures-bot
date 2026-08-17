@@ -215,6 +215,40 @@ def test_send_rebalance_notification_formats_empty_lists_as_none(env_credentials
     assert "XRP" in text
 
 
+def test_send_rebalance_notification_marks_no_exit_cycle_distinctly(env_credentials, monkeypatch):
+    """★ 2026-08-17 사용자 발견 회귀 테스트: 청산이 아예 없었던 사이클(
+    신규진입만)은 "$0.00"이 진짜 계산 결과가 아니라 청산이 없어서라는 걸
+    문구로 명시해야 한다 - 예전엔 항상 하드코딩된 0.0이라 이 구분이
+    아예 불가능했다(실제로 청산 5건이 있었던 사이클도 "$0.00"으로
+    표시됐던 사고)."""
+    sent_texts: list = []
+    monkeypatch.setattr(telegram, "send_message", lambda text, chat_id=None: sent_texts.append(text) or True)
+
+    telegram.send_rebalance_notification(
+        new_long=["BTC"], new_short=["ETH"], exited_long=[], exited_short=[],
+        turnover_pct=100.0, realized_pnl_usd=0.0,
+    )
+
+    text = sent_texts[0]
+    assert "청산 없음" in text
+
+
+def test_send_rebalance_notification_does_not_add_no_exit_label_when_exits_happened(env_credentials, monkeypatch):
+    """경계: 청산이 실제로 있었으면(설사 결과 손익이 우연히 $0.00이어도)
+    "청산 없음" 문구를 붙이지 않는다 - 청산 유무 판단은 realized_pnl_usd
+    값이 아니라 exited_long/exited_short 리스트로만 한다."""
+    sent_texts: list = []
+    monkeypatch.setattr(telegram, "send_message", lambda text, chat_id=None: sent_texts.append(text) or True)
+
+    telegram.send_rebalance_notification(
+        new_long=["BTC"], new_short=[], exited_long=["XRP"], exited_short=[],
+        turnover_pct=50.0, realized_pnl_usd=0.0,  # 우연히 0이어도
+    )
+
+    text = sent_texts[0]
+    assert "청산 없음" not in text
+
+
 def test_send_daily_summary_includes_per_leg_breakdown(env_credentials, monkeypatch):
     sent_texts: list = []
     monkeypatch.setattr(telegram, "send_message", lambda text, chat_id=None: sent_texts.append(text) or True)

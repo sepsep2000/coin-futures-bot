@@ -394,6 +394,15 @@ def _process_2a_rebalance(cfg: dict, db_path: Path, data_exchange, exec_exchange
     leg_equity = total_equity * cfg["portfolio"]["weights"]["2a"]
 
     # --- 1단계: 청산 전부 ---
+    # ★ 2026-08-17 사용자 발견 대응: realized_pnl_usd가 여태 0.0으로
+    # 하드코딩돼 있었다(실제로 청산이 있었던 8/16 사이클도 텔레그램/DB에
+    # "$0.00"으로 잘못 표시됨, 실측 재구성 결과 그 사이클만 +$15.99였음).
+    # 청산 체결가(result.avg_fill_price, 진입 경로와 동일하게 None 폴백)와
+    # 원래 진입가로 가격 기준 실현손익을 직접 계산해 누적한다 - 수수료는
+    # place_order()의 OrderResult에 없어 제외(다른 realized PnL 보고
+    # 지점, 예: filtered_trend 텔레그램 r_multiple도 동일하게 가격 기준만
+    # 씀 - 새 계산방식 아님, 기존 관례 그대로).
+    realized_pnl_usd = 0.0
     for symbol in sorted(exited_long | exited_short):
         pos = next(p for p in current_positions if p["symbol"] == symbol)
         capped_qty = _verify_and_cap_close_qty(exec_exchange, symbol, pos["direction"], pos["qty"])
@@ -405,6 +414,11 @@ def _process_2a_rebalance(cfg: dict, db_path: Path, data_exchange, exec_exchange
         close_direction = "short" if pos["direction"] == "long" else "long"
         result = executor.place_order(exec_exchange, db_path, symbol, close_direction, capped_qty, reduce_only=True)
         if result.status == "filled":
+            exit_price = result.avg_fill_price
+            if exit_price is None:
+                exit_price = exec_exchange.fetch_ticker(symbol)["last"]
+            sign = 1.0 if pos["direction"] == "long" else -1.0
+            realized_pnl_usd += sign * (exit_price - pos["entry_price"]) * result.filled_qty
             live_state.delete_position(db_path, symbol, "2a")
             executor.cancel_stop_orders(exec_exchange, symbol)
 
@@ -433,12 +447,12 @@ def _process_2a_rebalance(cfg: dict, db_path: Path, data_exchange, exec_exchange
         db_path, ts.isoformat(),
         new_long=sorted(new_long), new_short=sorted(new_short),
         exited_long=sorted(exited_long), exited_short=sorted(exited_short),
-        turnover_pct=turnover_pct, realized_pnl_usd=0.0,  # 실현손익 계산은 trades 원장이 없어 이번 범위 밖(모듈 docstring 참조)
+        turnover_pct=turnover_pct, realized_pnl_usd=realized_pnl_usd,
     )
     telegram.send_rebalance_notification(
         new_long=sorted(new_long), new_short=sorted(new_short),
         exited_long=sorted(exited_long), exited_short=sorted(exited_short),
-        turnover_pct=turnover_pct, realized_pnl_usd=0.0,
+        turnover_pct=turnover_pct, realized_pnl_usd=realized_pnl_usd,
     )
 
 

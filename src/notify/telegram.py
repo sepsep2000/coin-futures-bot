@@ -133,7 +133,18 @@ def send_rebalance_notification(new_long: list[str], new_short: list[str],
                                  exited_long: list[str], exited_short: list[str],
                                  turnover_pct: float, realized_pnl_usd: float) -> bool:
     """2a 주간 리밸런스 실행 결과 — 신규/청산 자산 목록, 회전율, 이번 주
-    실현손익(LIVE_EXECUTION_ARCHITECTURE.md 4절, SPEC 5절 확장분)."""
+    실현손익(LIVE_EXECUTION_ARCHITECTURE.md 4절, SPEC 5절 확장분).
+
+    ★ 2026-08-17 사용자 발견 대응: realized_pnl_usd가 예전엔 항상
+    0.0으로 하드코딩돼 있어서(scheduler.py 쪽 수정 완료), "진짜 청산이
+    없어서 0"과 "계산이 아예 안 돼서 0"을 구분할 방법이 없었다(실측:
+    청산 5건이 실제로 있었던 사이클도 "$0.00"으로 표시됨). 이제
+    scheduler.py가 실측 체결가로 계산해 넘겨주므로, 여기서는 청산 자체가
+    없었던 사이클만 문구로 명시해 둘을 헷갈리지 않게 한다."""
+    if not exited_long and not exited_short:
+        pnl_line = f"실현 PnL: ${realized_pnl_usd:,.2f} (청산 없음, 신규진입만)"
+    else:
+        pnl_line = f"실현 PnL: ${realized_pnl_usd:,.2f}"
     lines = [
         "[2a] 주간 리밸런스",
         f"신규 롱: {', '.join(new_long) if new_long else '없음'}",
@@ -141,7 +152,7 @@ def send_rebalance_notification(new_long: list[str], new_short: list[str],
         f"청산 롱: {', '.join(exited_long) if exited_long else '없음'}",
         f"청산 숏: {', '.join(exited_short) if exited_short else '없음'}",
         f"회전율: {turnover_pct:.2f}%",
-        f"실현 PnL: ${realized_pnl_usd:,.2f}",
+        pnl_line,
     ]
     return send_message("\n".join(lines))
 

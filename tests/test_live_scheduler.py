@@ -383,6 +383,9 @@ class _StubMarketOrderExchange:
     def fapiPrivateGetOpenAlgoOrders(self):
         return list(self._algo_orders)
 
+    def fetch_ticker(self, symbol):
+        return {"last": self.fill_price}
+
 
 def test_compute_bars_held_zero_on_entry_and_increments_per_bar():
     entry_time = pd.Timestamp("2026-07-20 00:00:00", tz="UTC")
@@ -1090,3 +1093,70 @@ def test_process_2a_rebalance_exit_order_uses_reduce_only(db_path, monkeypatch):
 
     assert exchange.calls == [{"symbol": "BTC/USDT:USDT", "side": "sell", "qty": 0.01, "reduceOnly": True}]
     assert load_open_positions(db_path, strategy="2a") == []
+
+
+# =====================================================================
+# _process_2a_rebalance realized_pnl_usd — 2026-08-17 사용자 발견 회귀
+# (예전엔 항상 0.0 하드코딩이라, 실제로 청산 5건이 있었던 사이클도
+# "$0.00"으로 잘못 표시됐었다)
+# =====================================================================
+
+def test_process_2a_rebalance_computes_real_realized_pnl_from_fill_price(db_path, monkeypatch):
+    """정상: 청산이 있으면 실제 체결가(진입가 대비)로 realized_pnl_usd를
+    계산해 save_rebalance_log/send_rebalance_notification에 넘긴다."""
+    save_position(db_path, "BTC/USDT:USDT", "2a", "long", 0.01, 60000.0, "2026-08-01T00:00:00+00:00", 42000.0)
+
+    monkeypatch.setattr(scheduler, "update_ohlcv_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "update_funding_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.strategy_2a, "run_live_step",
+                         lambda cfg, project_root, ts: {"long_group": set(), "short_group": set(),
+                                                          "weight": 0.0, "as_of": ts})
+
+    exchange = _StubMarketOrderExchange(fill_price=60100.0, real_positions=[
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "long"},
+    ])
+    cfg = {
+        "data": {"ohlcv_cache_dir": "data/ohlcv", "funding_cache_dir": "data/funding", "since": "2023-01-01T00:00:00Z"},
+        "portfolio": {"weights": {"2a": 0.15}},
+        "costs": {"slippage_pct": 0.03, "taker_fee_pct": 0.05},
+    }
+    saved_pnl = []
+    notified_pnl = []
+    monkeypatch.setattr(scheduler.live_state, "save_rebalance_log",
+                         lambda *a, **k: saved_pnl.append(k["realized_pnl_usd"]))
+    monkeypatch.setattr(scheduler.telegram, "send_rebalance_notification",
+                         lambda **k: notified_pnl.append(k["realized_pnl_usd"]) or True)
+
+    scheduler._process_2a_rebalance(cfg, db_path, object(), exchange, pd.Timestamp("2026-08-16", tz="UTC"),
+                                     total_equity=10000.0, entries_blocked=False)
+
+    expected = (60100.0 - 60000.0) * 0.01  # 롱 청산: (체결가-진입가)*수량
+    assert saved_pnl == [pytest.approx(expected)]
+    assert notified_pnl == [pytest.approx(expected)]
+
+
+def test_process_2a_rebalance_realized_pnl_stays_zero_when_only_entries(db_path, monkeypatch):
+    """경계: 청산 없이 신규진입만 있으면 realized_pnl_usd는 0.0 그대로
+    (계산 누락이 아니라 진짜 청산이 없어서인 케이스)."""
+    monkeypatch.setattr(scheduler, "update_ohlcv_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "update_funding_cache", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.strategy_2a, "run_live_step",
+                         lambda cfg, project_root, ts: {"long_group": {"BTC"}, "short_group": set(),
+                                                          "weight": 1.0, "as_of": ts})
+    monkeypatch.setattr(scheduler, "_qty_step_and_min", lambda exchange, symbol: (0.001, 0.001))
+
+    exchange = _StubMarketOrderExchange(fill_price=60000.0, real_positions=[])
+    cfg = {
+        "data": {"ohlcv_cache_dir": "data/ohlcv", "funding_cache_dir": "data/funding", "since": "2023-01-01T00:00:00Z"},
+        "portfolio": {"weights": {"2a": 0.15}},
+        "costs": {"slippage_pct": 0.03, "taker_fee_pct": 0.05},
+    }
+    saved_pnl = []
+    monkeypatch.setattr(scheduler.live_state, "save_rebalance_log",
+                         lambda *a, **k: saved_pnl.append(k["realized_pnl_usd"]))
+    monkeypatch.setattr(scheduler.telegram, "send_rebalance_notification", lambda **k: True)
+
+    scheduler._process_2a_rebalance(cfg, db_path, object(), exchange, pd.Timestamp("2026-08-16", tz="UTC"),
+                                     total_equity=10000.0, entries_blocked=False)
+
+    assert saved_pnl == [0.0]
