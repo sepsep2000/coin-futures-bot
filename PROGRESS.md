@@ -1,5 +1,47 @@
 # PROGRESS.md
 
+## 2026-08-17 — realized_pnl_usd 하드코딩 수정 + 과거 기록 보정 + 재정산
+
+`_process_2a_rebalance`가 청산 손익을 항상 `0.0`으로 하드코딩(주석: "실현손익
+계산은 trades 원장이 없어 이번 범위 밖")하던 걸 사용자가 텔레그램 리밸런스
+알림에서 발견해 지적. 실제로 청산 5건이 있었던 8/16 사이클(진짜 +$15.99)도
+"$0.00"으로 표시됨 — 사용자 승인 하 수정.
+
+**수정**: `scheduler.py::_process_2a_rebalance` 청산 루프에서 각 청산 주문의
+`result.avg_fill_price`(없으면 `fetch_ticker` 폴백)와 원래 진입가로 실현손익을
+직접 계산해 누적, `save_rebalance_log`/`send_rebalance_notification`에 실측값
+전달. `telegram.py::send_rebalance_notification`은 `exited_long`/
+`exited_short`가 둘 다 빈 사이클(신규진입만)일 때 "$0.00(청산 없음, 신규진입만)"
+으로 문구를 구분해, 계산 누락과 진짜 0을 헷갈리지 않게 함.
+
+**과거 기록 보정**: `data/state.db::rebalance_log` 5행 전수조사 — id=1(7/26),
+2(8/2), 4(8/11 사고 재진입)는 실제로 청산 없는 사이클이라 0.0이 맞음(변경
+없음). id=3(8/9)과 id=5(8/16)는 진짜 청산이 있었는데 0.0으로 잘못 기록돼
+있었음 — Binance `fapiPrivateGetIncome` 실측 기준으로 직접 계산해 보정:
+- id=3 (8/9 리밸런스, BNB/UNI/AAVE/LINK/ZEC 청산): `0.0` → `-22.2336`
+- id=5 (8/16 리밸런스, DOT/INJ/NEAR/SOL/XRP 청산): `0.0` → `15.9924`
+
+**재정산(순수 전략 수익)**: 기존 사고 정산(`reports/
+G4_2A_ACCIDENTAL_LIQUIDATION_20260811.md`, `G4_ETH_MANAGEMENT_PHANTOM_
+LONG_20260811.md` 기반, ~8/12 09:34 UTC 컷오프까지 산출된 "-$6.85")은
+Binance 실측 income 원장에서 직접 계산한 것이라 DB의 `realized_pnl_usd`
+버그와 무관하게 8/9의 진짜 손익을 이미 포함하고 있었음 — 즉 이번 DB 보정
+자체는 재정산 수치를 바꾸지 않음. 다만 8/16 사이클은 이전 정산 시점(8/12)
+보다 나중에 발생해 그 계산 범위 밖이었으므로, 같은 방법론(사고 구간 A1~A5
+제외, 나머지 전부 정상)으로 8/12 09:34 UTC~현재(8/17)까지 신규 income 원장을
+추가 반영: 델타 -$1.28(REALIZED_PNL +$3.05, COMMISSION -$3.78, FUNDING_FEE
+-$0.55 — 8/16 리밸런스 5건 청산 + 8/17 ETH 트레이드 + 그 사이 펀딩비).
+**순수 전략 수익 최종: -$6.855 + (-$1.2768) = -$8.13**(기존 -$6.85에서 악화,
+8/16 리밸런스 자체는 +지만 8/17 ETH 트레이드 손실·펀딩비가 더 큼).
+
+**테스트**: 신규 4개(텔레그램 문구구분 2개, PnL계산 정상/무청산 경계 2개) +
+`_StubMarketOrderExchange`에 `fetch_ticker` 추가. `tests/ -x -q` 336/336
+통과(Windows/WSL 양쪽).
+
+**재가동**: 일시정지(PID 25732 종료) → 적용 → 테스트 통과 → 재시작(새 PID) →
+`recover_state()` 정합성 통과, 첫 틱 정상 → 거래소 실측 재확인(2a 8개 포지션
+DB-거래소 일치) — 전 과정 실거래 영향 없음.
+
 ## 2026-08-12 (이어서) — 청산 경로 전수조사 + reduceOnly/실측확인 일괄 적용
 
 ETH phantom long 사고(직전 기록) 원인과 같은 패턴이 다른 청산 경로에도
