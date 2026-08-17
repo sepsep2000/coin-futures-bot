@@ -13,12 +13,19 @@ DB 조회가 유일한 방법이지만, 만약 DB에 대응 레코드가 없으�
 DB가 오염/누락된 경우) "전략 미상(DB 미기록)"으로 명시하지 절대 추측하지
 않는다.
 
+★ 2026-08-17 추가(사용자 요청): "사고 제외 순수 realized PnL" 3줄
+(전체/사고분/순수분)을 매일 자동 표시 - reports/incidents.yaml 사고
+레지스트리 기반(src/live/incident_pnl.py, 순수함수). 새 사고가 확정되면
+레지스트리에 항목만 추가하면 다음 실행부터 자동 반영되고, 이 스크립트
+코드는 수정할 필요가 없다.
+
 사용:
     python scripts/daily_report.py
 """
 
 from __future__ import annotations
 
+import datetime
 import sys
 from pathlib import Path
 
@@ -30,11 +37,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.live import executor  # noqa: E402
+from src.live import incident_pnl  # noqa: E402
 from src.live import state as live_state  # noqa: E402
 from src.live.state import resolve_db_path  # noqa: E402
 from src.notify import telegram  # noqa: E402
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
+INCIDENTS_PATH = PROJECT_ROOT / "reports" / "incidents.yaml"
 KST_OFFSET_HOURS = 9  # UTC 23:00 실행 = KST 08:00(다음날) — cron 등록 시각과 일치
 
 
@@ -47,7 +56,40 @@ def _strategy_label(db_positions_by_symbol: dict, symbol: str) -> str:
     return pos["strategy"] if pos else "전략 미상(DB 미기록)"
 
 
-def build_report_text(cfg: dict, exchange, db_path: Path, now_utc) -> str:
+def fetch_pnl_classification(exchange) -> dict:
+    """incidents.yaml 등록 사고 기준으로 G4 시작~현재 실현PnL을 사고/정상
+    분리한다 - I/O(income 원장 조회, 레지스트리 파일 읽기)는 여기서만
+    하고, 분류 계산 자체는 incident_pnl.classify()(순수함수)에 위임."""
+    registry = incident_pnl.load_incidents(INCIDENTS_PATH)
+    g4_start_dt = datetime.datetime.fromisoformat(registry["g4_start"].replace("Z", "+00:00"))
+    start_ms = int(g4_start_dt.timestamp() * 1000)
+    income_records = executor.fetch_income_since(exchange, start_ms)
+    return incident_pnl.classify(income_records, registry["incidents"])
+
+
+def build_pnl_reconciliation_lines(classification: dict) -> list[str]:
+    """fetch_pnl_classification() 결과를 리포트 3줄로 포맷 - 숫자 계산과
+    텍스트 포맷을 분리해 네트워크 없이 단위테스트 가능하게 한다. 매칭
+    레코드가 0건인 등록 사고가 있으면(시간창 오기입 등 조기 발견 목적)
+    경고를 stderr에 남긴다(CLAUDE.md "예외를 조용히 삼키지 않는다" 원칙 -
+    텔레그램 알림 자체를 막지는 않되 반드시 어딘가엔 남긴다)."""
+    unmatched = classification.get("unmatched_impact_incidents") or []
+    if unmatched:
+        print(
+            f"[daily_report] 경고: incidents.yaml에 등록된 사고 중 이번 조회 구간에서 "
+            f"매칭된 income 레코드가 0건인 항목이 있음(시간창/심볼 오기입 의심): {unmatched}",
+            file=sys.stderr,
+        )
+    return [
+        "",
+        "[실현 PnL 정산 (G4 누적)]",
+        f"전체: ${classification['grand_total']:,.2f}",
+        f"사고분: ${classification['accident_total']:,.2f}",
+        f"순수 전략: ${classification['normal_total']:,.2f}",
+    ]
+
+
+def build_report_text(cfg: dict, exchange, db_path: Path, now_utc, pnl_classification: dict) -> str:
     """실제 발신 전, 포맷/숫자를 독립적으로 테스트할 수 있게 텍스트 생성과
     발신을 분리한다(send_message는 네트워크 호출이라 단위테스트 어려움)."""
     balance = exchange.fetch_balance()
@@ -91,6 +133,8 @@ def build_report_text(cfg: dict, exchange, db_path: Path, now_utc) -> str:
     lines.append("")
     lines.append(f"미실현 PnL 합계: ${total_unrealized:,.2f}")
 
+    lines.extend(build_pnl_reconciliation_lines(pnl_classification))
+
     return "\n".join(lines)
 
 
@@ -101,7 +145,8 @@ def main() -> bool:
     exchange.load_markets()
 
     now_utc = pd.Timestamp.now(tz="UTC")
-    text = build_report_text(cfg, exchange, db_path, now_utc)
+    pnl_classification = fetch_pnl_classification(exchange)
+    text = build_report_text(cfg, exchange, db_path, now_utc, pnl_classification)
     return telegram.send_message(text)
 
 

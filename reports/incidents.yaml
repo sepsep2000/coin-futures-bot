@@ -1,0 +1,95 @@
+# reports/incidents.yaml — 사고 이벤트 레지스트리
+#
+# "사고 제외 순수 realized PnL" 자동 집계(src/live/incident_pnl.py,
+# scripts/daily_report.py)가 참조하는 유일한 사고 정의 소스. 새 사고가
+# 확정되면 아래 형식으로 incidents 리스트에 항목만 추가한다 — 코드 수정
+# 불필요, daily_report.py가 다음 실행부터 자동 반영한다.
+#
+# 매칭 규칙(src/live/incident_pnl.py::classify):
+#   income 레코드가 [start, end) 시간창 안에 있고 symbols에 포함되면
+#   "사고분"으로 분류한다. symbols를 넓게/시간창을 길게 잡으면 사고와
+#   무관한 정상 활동(예: 같은 기간 다른 심볼의 펀딩비)까지 잘못 사고로
+#   분류될 수 있으니, 항상 실측 문서(report 필드)의 타임스탬프 기준으로
+#   최대한 좁게 잡는다.
+#
+# pnl_impact: false인 항목은 집계에서 항상 0으로 취급한다(거래/PnL
+# 영향이 없는 순수 인프라 장애를 문서화 목적으로만 등록할 때 사용).
+#
+# g4_start: 현재 실거래 세션(G4) 시작 시각 - daily_report.py의 "누적
+# 순수 전략 수익" 계산 시작점으로 사용.
+
+g4_start: "2026-07-25T15:14:51Z"
+
+incidents:
+  - id: "20260727_2a_killswitch_liquidation"
+    title: "2a 킬스위치 조기 강제청산"
+    start: "2026-07-27T06:15:00Z"
+    end: "2026-07-27T06:17:00Z"
+    strategy: "2a"
+    symbols: ["AAVEUSDT", "AVAXUSDT", "UNIUSDT", "XMRUSDT", "BCHUSDT", "NEARUSDT", "XLMUSDT", "ZECUSDT"]
+    pnl_impact: true
+    report: "reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md"
+    note: >
+      filtered_trend 부분익절 상태갱신 실패(NoneType) 버그로 로컬 DB가
+      오염된 상태에서 킬스위치가 발동, 로컬 DB만 신뢰해 2a 8개 포지션을
+      조기 강제청산(06:15:46~49 UTC). 진입(07-26 00:00 UTC 정상 주간
+      사이클)은 제외, 청산 체결분만 사고로 분류.
+
+  - id: "20260726_0727_filtered_trend_partial_exit_bug"
+    title: "filtered_trend ETH 부분익절 반복 버그 + 킬스위치 배증"
+    start: "2026-07-26T23:15:00Z"
+    end: "2026-07-27T12:53:00Z"
+    strategy: "filtered_trend"
+    symbols: ["ETHUSDT"]
+    pnl_impact: true
+    report: "reports/G4_KILLSWITCH_INCIDENT_ANALYSIS.md"
+    note: >
+      avg_fill_price=None 가드 누락으로 부분익절 매도가 8회 반복되며
+      롱→숏으로 전환, 킬스위치가 청산 대신 숏 노출을 배증시킴. 최초
+      정상 진입(07-26 22:15:53)은 제외, 첫 오작동 매도(23:15:55)부터
+      최종 수동 청산(07-27 12:52:31)까지 포함.
+
+  - id: "20260811_2a_integration_test_liquidation"
+    title: "통합테스트 오청산 + 즉시 재진입"
+    start: "2026-08-11T13:00:00Z"
+    end: "2026-08-11T13:20:00Z"
+    strategy: "2a"
+    symbols: ["ADAUSDT", "XMRUSDT", "NEARUSDT", "SOLUSDT", "ZECUSDT", "INJUSDT", "XLMUSDT", "XRPUSDT", "BNBUSDT", "DOTUSDT", "LINKUSDT"]
+    pnl_impact: true
+    report: "reports/G4_2A_ACCIDENTAL_LIQUIDATION_20260811.md"
+    note: >
+      pytest -m integration 실행 중 통합테스트의 계좌 전체 정리 헬퍼이
+      계좌 보유 2a 8개 포지션을 전부 오청산(13:00:46~48 UTC). 사용자
+      승인 하 정식 리밸런스 로직(run_live_step)으로 즉시 재진입
+      (13:15:21 UTC~, 새 목표 8개 - 3개 신규 포함) 커미션까지 포함.
+
+  - id: "20260811_0812_eth_phantom_long"
+    title: "filtered_trend 관리경로 오작동 - 청산이 신규진입으로 뒤집힘"
+    start: "2026-08-11T19:31:33Z"
+    end: "2026-08-12T09:35:00Z"
+    strategy: "filtered_trend"
+    symbols: ["ETHUSDT"]
+    pnl_impact: true
+    report: "reports/G4_ETH_MANAGEMENT_PHANTOM_LONG_20260811.md"
+    note: >
+      거래소 스탑 자동 체결(19:31:32) 후 DB가 갱신되기 전 다음 틱이
+      reduceOnly 없는 청산 주문을 제출해 반대 방향 신규 롱 포지션 생성.
+      그 직전 정상 진입-스탑청산(08-11 15:45~19:31:32)은 전략이 설계대로
+      작동한 정상 결과이므로 제외 - start를 스탑 체결 1초 뒤(19:31:33)로
+      잡아 그 REALIZED_PNL을 사고분에 섞이지 않게 하고, 오작동 매수
+      (19:45:19)부터 수동 청산(08-12 09:34:29)까지만 사고로 분류.
+
+  - id: "20260727_0728_parquet_cache_corruption"
+    title: "OHLCV parquet 캐시 손상 (알림 폭주, 거래 영향 없음)"
+    start: "2026-07-27T14:30:00Z"
+    end: "2026-07-27T21:40:00Z"
+    strategy: null
+    symbols: []
+    pnl_impact: false
+    report: "PROGRESS.md#2026-07-28"
+    note: >
+      save_cache()가 원자적 쓰기가 아니어서 ETH parquet 캐시가 손상,
+      매 15분 틱 실패 → healthcheck가 CRITICAL 알림 58건 폭주. 실측
+      확인 결과 열린 포지션·미체결주문 0건 - 실제 거래/PnL 영향 없음.
+      집계에서는 항상 0으로 취급(pnl_impact: false), 문서화 목적으로만
+      등록한다.

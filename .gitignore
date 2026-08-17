@@ -5,6 +5,7 @@
 /logs/
 /reports/*
 !/reports/*.md
+!/reports/incidents.yaml
 !/reports/diag_data/
 /reports/diag_data/*
 !/reports/diag_data/*.csv

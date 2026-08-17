@@ -19,6 +19,12 @@ ccxt 자체가 제공하는 옵션(`disableFuturesSandboxWarning: True`)으로
 파라미터를 place_order/poll_order_status/cancel_order/ensure_stop_placed에
 추가했다 — "모든 주문 결과는 state.py로 기록"이 설계 문서 자체의 요구사항인데
 골격 시그니처엔 상태 저장 경로가 없어서 넣지 않으면 요구사항을 못 지킨다.
+
+★ 설계 문서 대비 확장 3건(사전 보고, 2026-08-17): 사고/정상 실현PnL 자동
+분리(src/live/incident_pnl.py) 기능을 위해 fetch_income_since() 신설 —
+Binance 실측 income 원장(`fapiPrivateGetIncome`)을 페이지네이션으로 전량
+조회한다. 이 함수는 조회 전용(주문 실행 없음)이라 순수 I/O 래퍼로만
+두고, 사고 구간 분류 로직(순수함수)은 incident_pnl.py로 분리한다.
 """
 
 from __future__ import annotations
@@ -375,3 +381,36 @@ def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
         f"확인/배치하지 못함 (마지막 오류: {last_error}) - 즉시 수동 확인 필요"
     )
     return StopPlacementResult(stop_confirmed=False)
+
+
+def fetch_income_since(exchange, start_ms: int, page_limit: int = 1000) -> list[dict]:
+    """`start_ms`(epoch ms, UTC) 이후 전체 income 원장을 페이지네이션으로
+    조회한다(REALIZED_PNL/COMMISSION/FUNDING_FEE 등 전 타입 포함, 필터링은
+    호출부 책임). 재시도는 CLAUDE.md 표준(3회 지수백오프)을 따른다 - 이
+    함수가 실패하면 사고/정상 PnL 분리 자체가 불가능하므로 조용히 빈
+    리스트를 반환하지 않고 예외를 그대로 전파한다(호출부가 CRITICAL 처리)."""
+    records: list[dict] = []
+    cursor_ms = start_ms
+    while True:
+        last_error: Optional[Exception] = None
+        page: Optional[list] = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                page = exchange.fapiPrivateGetIncome({"startTime": cursor_ms, "limit": page_limit})
+                break
+            except Exception as exc:  # noqa: BLE001 - CLAUDE.md 표준: 재시도 소진 시에만 전파
+                last_error = exc
+                _log_stderr(f"fetch_income_since 시도 {attempt}/{MAX_RETRIES} 실패: {type(exc).__name__}: {exc}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(2 ** attempt)
+        if page is None:
+            raise RuntimeError(f"fetch_income_since: {MAX_RETRIES}회 재시도 후에도 실패") from last_error
+
+        if not page:
+            break
+        records.extend(page)
+        if len(page) < page_limit:
+            break
+        cursor_ms = page[-1]["time"] + 1
+
+    return records
