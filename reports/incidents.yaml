@@ -93,3 +93,24 @@ incidents:
       확인 결과 열린 포지션·미체결주문 0건 - 실제 거래/PnL 영향 없음.
       집계에서는 항상 0으로 취급(pnl_impact: false), 문서화 목적으로만
       등록한다.
+
+  - id: "20260822_stop_fallback_alert_storm"
+    title: "ensure_stop_placed() -2021 폴백 재검증 누락 - 24시간 CRITICAL 알림 폭주 (거래 영향 없음)"
+    start: "2026-08-22T00:12:00Z"
+    end: "2026-08-23T00:02:41Z"
+    strategy: "2a"
+    symbols: []
+    pnl_impact: false
+    report: "PROGRESS.md#2026-08-23"
+    note: >
+      AAVE/ADA/BCH/UNI 4개 숏 포지션이 정상 손절(08-21 08:27~08-22
+      00:40 UTC, 각 -$56~58, 합 -$227.79 - 이건 정상 시장손실이지 사고
+      아님)로 거래소에서 순차 청산됐으나, ensure_stop_placed()의 -2021
+      폴백이 매 틱 거래소 재확인 없이 긴급 reduceOnly 청산을 재시도하다
+      이미 없는 포지션에 대해 -2022(ReduceOnly Order is rejected)로 계속
+      거부당함 - 약 24시간 동안 매 틱 CRITICAL 반복 발신, 08-23 00:00 UTC
+      2a 주간 리밸런스의 _verify_and_cap_close_qty()가 DB만 정리하며
+      해소. 모든 재시도가 거부돼 실제 체결은 0건 - 추가 PnL 영향 없음.
+      2026-08-23 ensure_stop_placed()에 동일한 거래소 재검증을 추가해
+      재발 방지(회귀 테스트: test_ensure_stop_placed_skips_emergency_
+      close_when_exchange_already_flat 등).

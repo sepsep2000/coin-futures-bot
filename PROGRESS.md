@@ -1,5 +1,79 @@
 # PROGRESS.md
 
+## 2026-08-23 — ensure_stop_placed() -2021 폴백 거래소 재검증 추가 + 5일 공백 헬스체크 전수조사
+
+**배경(5일 공백 조사, 8/18~8/23)**: 사용자 부재중 발생한 healthcheck FAIL
+266건을 전수 재검토. 3개 클러스터 확인:
+1. 8/19 15:42~21:12 UTC ETH DB/거래소 일시 불일치 - `fetch_income_since()`
+   대조 결과 filtered_trend 진입/청산 직후 DB 반영 지연으로 추정, CRITICAL/
+   에러 로그 없이 자연 해소. 경미, 추가 조치 없음.
+2. **8/22 00:12~23:42 UTC AAVE/ADA/BCH/UNI 불일치(핵심 사고)** - 아래 상술.
+3. 8/23 00:57 UTC telegram_reachable 1회 실패 - 이후 전부 정상, 단발성.
+
+**사고 경위(AAVE/ADA/BCH/UNI)**: 4개 숏 포지션이 각각 다른 시각에 정상
+손절됨(`fetch_income_since()` 실측: BCH 08/21 08:27:21 -$57.83, AAVE
+08/21 10:38:00 -$56.78, ADA 08/21 22:19:08 -$56.92, UNI 08/22 00:40:13
+-$56.26 - 손실폭이 서로 유사해 시장 하락에 의한 정상 스탑아웃으로 판단,
+합 -$227.79는 정상 시장손실이지 사고 아님). 그러나 `ensure_stop_placed()`
+의 -2021(OrderImmediatelyFillable) 폴백이 긴급 reduceOnly 청산 주문을
+넣기 전 거래소 실측을 재확인하지 않아, 포지션이 이미 사라진 뒤에도 매
+틱 청산을 재시도하다 -2022(ReduceOnly Order is rejected)로 계속
+거부당함 - 약 24시간 동안 매 틱 CRITICAL 반복 발신(healthcheck 기준
+08/22 00:12~23:42, 약 94회 15분 간격). 08/23 00:00 UTC 2a 주간
+리밸런스의 `_verify_and_cap_close_qty()`(2026-08-11 ETH phantom long
+사고 대응으로 이미 존재)가 거래소 재검증 후 DB만 정리하며 해소.
+Binance reduceOnly 보호로 모든 오작동 재시도가 거부돼 **실제 체결 0건,
+추가 금전 피해 없음** - 순수 알림 폭주 + 24시간 DB/거래소 불일치 방치.
+
+**근본원인**: 같은 2026-08-11 세션에 `_verify_and_cap_close_qty()`
+(scheduler.py, ETH phantom long 대응)와 `ensure_stop_placed()`의 -2021
+폴백(executor.py, 사고② 대응)이 같은 날 별도로 추가됐는데, "청산 주문
+전 거래소 재검증"이라는 동일한 교훈이 전자에만 반영되고 후자엔 누락됨 -
+같은 날 두 함수를 만들며 생긴 조정 공백.
+
+**수정**: [executor.py](src/live/executor.py) `ensure_stop_placed()`에
+`_position_still_open()` 헬퍼 추가 - -2021 폴백이 긴급청산을 시도하기
+전 `fetch_positions()`로 실제 포지션 존재/방향을 확인, 없거나 반전됐으면
+청산 주문 없이 `already_closed_on_exchange=True`로 즉시 반환.
+`StopPlacementResult`에 `already_closed_on_exchange` 필드 추가.
+[scheduler.py](src/live/scheduler.py) `_handle_stop_result()`가 이
+필드를 처리 - DB 정리 + `send_message`(일반 알림, CRITICAL 아님)로
+"이미 없었음" 사실만 1회 전달, 알림 폭주 재발 방지.
+
+**전수 재확인**: scheduler.py 내 reduceOnly/청산 주문 지점 전부 점검
+(`_execute_kill_switch_liquidation`, `_process_2a_rebalance`,
+`_manage_filtered_trend_position` 등) - 전부 `fetch_positions()`
+실측이나 `_verify_and_cap_close_qty()` 기반으로 이미 거래소 재검증을
+거치고 있었음. `ensure_stop_placed()`의 -2021 폴백만 유일한 누락
+지점이었음을 확인.
+
+**테스트**: executor.py에 신규 3개(거래소에 포지션 없으면 청산 스킵,
+방향 반전 시에도 스킵, 실제 있으면 기존대로 청산 진행) + scheduler.py에
+신규 1개(`already_closed_on_exchange` 시 DB 정리+일반알림, CRITICAL
+아님) + 기존 `closed_instead` 관련 스텁 9곳에 신규 필드 보강(회귀 방지) +
+`incidents.yaml` 신규 등록으로 `test_load_incidents_real_registry_file_
+parses_without_error` 카운트 5→6 수정. `pytest tests/ -x -q`
+357/357 통과(.venv, .venv-wsl 양쪽).
+
+**사고 기록**: `reports/incidents.yaml`에
+`20260822_stop_fallback_alert_storm` 등록, `pnl_impact: false`(체결
+0건이므로 집계에서 항상 0 취급, 문서화 목적).
+
+**적용**: 거래소·DB 실측 8/8 일치 확인 후 봇 재시작, 재확인 후에도 8/8
+일치 유지. 재시작 과정에서 별도 인프라 이슈 발견(아래 항목).
+
+**미해결/별도 확인 필요**: 봇 재시작 시도 중 `nohup`/`setsid` 배경 실행이
+WSL 세션에서 수 초~수십 초 만에 아무 트레이스(크래시 로그·재시작
+배너 없음) 없이 사라지는 현상 반복 관측(WSL VM 자체는 재부팅 안 됨,
+`uptime -s` 불변). 최종적으로 Claude Code Bash 도구의
+`run_in_background`로 직접 띄운 프로세스는 정상 동작(heartbeat 갱신
+확인) - Task Scheduler(`RSIB_run_cycle`)의 자체 배경 실행 메커니즘도
+같은 증상을 보였는지는 명확히 확인 못함(관측 시점에 마침 대체 경로로
+전환함). 워치독이 "죽으면 재시작"만 하고 "왜 죽었는지"는 로깅하지
+않으므로, 다음에 동일 현상 재현되면 `logs/run_cycle.log`와 Windows
+이벤트 로그를 우선 확인할 것 - 이번엔 봇이 정상 재기동돼 긴급도가
+낮아져 별도 조사는 보류.
+
 ## 2026-08-17 (이어서) — 킬스위치 fetch_positions() 예외처리 누락 수정
 
 **사고 경위**: -1007 API 장애 도중(아래 항목 참조) 23:15 UTC에 연속오류
