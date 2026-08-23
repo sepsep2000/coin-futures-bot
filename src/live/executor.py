@@ -63,10 +63,19 @@ class StopPlacementResult:
     """2026-08-11 사고②③ 대응으로 ensure_stop_placed()의 반환 타입을
     bool에서 확장 - "스탑을 못 걸었다"와 "대신 즉시 시장가로 청산했다"는
     호출부(scheduler.py)가 서로 다르게(전자는 CRITICAL만, 후자는 포지션
-    상태 정리+알림) 처리해야 해서 bool 하나로는 구분이 안 됐다."""
+    상태 정리+알림) 처리해야 해서 bool 하나로는 구분이 안 됐다.
+
+    ★ 2026-08-23 사고 대응(AAVE/ADA/BCH/UNI, 약 24시간 CRITICAL 반복):
+    -2021 폴백이 긴급청산을 시도하기 전 거래소 실측을 확인하지 않아,
+    포지션이 이미 사라진 뒤에도 매 틱 reduceOnly 청산을 재시도하다
+    -2022(ReduceOnly Order is rejected)로 계속 거부당했다. already_closed_
+    on_exchange를 별도로 둬 "우리가 청산했다(closed_instead)"와 "이미
+    청산돼 있었다(already_closed_on_exchange)"를 구분한다 - 후자는
+    호출부가 청산 주문 없이 DB만 정리하면 된다."""
     stop_confirmed: bool
     closed_instead: bool = False
     close_result: Optional[OrderResult] = None
+    already_closed_on_exchange: bool = False
 
 
 def get_authenticated_exchange(testnet: bool = True) -> ccxt.Exchange:
@@ -296,6 +305,25 @@ def _safe_fetch_last_price(exchange, symbol: str) -> Optional[float]:
         return None
 
 
+def _position_still_open(exchange, symbol: str, expected_direction: str) -> bool:
+    """★ 2026-08-23 사고 대응: scheduler.py의 _verify_and_cap_close_qty()와
+    동일한 "주문 전 거래소 실측 재검증" 로직을 ensure_stop_placed()의 -2021
+    폴백에도 적용한다(실사고: AAVE/ADA/BCH/UNI가 이미 정상 손절로 거래소에서
+    사라진 뒤에도 이 폴백이 매 틱 reduceOnly 청산을 재시도하다 -2022로
+    계속 거부당해 약 24시간 CRITICAL을 반복 발생시켰다). scheduler.py의
+    함수를 직접 재사용하지 않는 이유는 executor.py가 더 하위 계층이라
+    scheduler.py를 import하면 의존 방향이 역전되기 때문 - 같은 조회
+    패턴(fetch_positions → symbol/방향 필터)만 그대로 가져온다."""
+    real_positions = [
+        p for p in exchange.fetch_positions()
+        if p.get("symbol") == symbol and p.get("contracts") and float(p["contracts"]) != 0
+    ]
+    if not real_positions:
+        return False
+    real_direction = "long" if real_positions[0].get("side") == "long" else "short"
+    return real_direction == expected_direction
+
+
 def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
                         max_retries: int = STOP_CHECK_MAX_RETRIES) -> StopPlacementResult:
     """포지션 존재 + 스탑 부재 = 최우선 복구 대상(CLAUDE.md). 매 시도마다
@@ -355,6 +383,13 @@ def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
             if isinstance(exc, ccxt.OrderImmediatelyFillable):
                 current_price = _safe_fetch_last_price(exchange, symbol)
                 if current_price is not None and _stop_condition_already_true(stop_side, stop_price, current_price):
+                    if not _position_still_open(exchange, symbol, position.direction):
+                        _log_stderr(
+                            f"ensure_stop_placed: {symbol} 스탑조건 충족 확인했으나 거래소에 포지션이 "
+                            f"이미 없음(정상 손절 등으로 선청산됨) - 긴급청산 주문 시도 없이 종료, "
+                            f"호출부가 DB만 정리해야 함"
+                        )
+                        return StopPlacementResult(stop_confirmed=False, already_closed_on_exchange=True)
                     close_direction = "short" if position.direction == "long" else "long"
                     close_result = place_order(exchange, db_path, symbol, close_direction, position.qty,
                                                 reduce_only=True)

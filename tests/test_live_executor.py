@@ -294,9 +294,12 @@ class _RaceConditionStubExchange:
     (가격이 이미 스탑을 넘었다고 가정), reduceOnly market 청산은 정상
     체결되는 상황을 흉내낸다(2026-08-11 사고②, 2026-07-27 실측 패턴)."""
 
-    def __init__(self, current_price, market_id="ETHUSDT"):
+    def __init__(self, current_price, market_id="ETHUSDT", position_symbol="ETH/USDT:USDT",
+                 position_side="long"):
         self.current_price = current_price
         self._market_id = market_id
+        self._position_symbol = position_symbol
+        self._position_side = position_side
         self.create_order_calls: list[dict] = []
 
     def load_markets(self):
@@ -310,6 +313,13 @@ class _RaceConditionStubExchange:
 
     def fetch_ticker(self, symbol):
         return {"last": self.current_price}
+
+    def fetch_positions(self):
+        """★ 2026-08-23 사고 대응: -2021 폴백이 긴급청산 전 거래소 실측
+        재검증을 하도록 바뀌어(_position_still_open) 이 스텁도 기본적으로
+        "포지션이 아직 열려있음"을 반환해야 기존 정상 케이스가 안 깨진다 -
+        "이미 사라짐" 케이스는 _AlreadyClosedStubExchange가 오버라이드."""
+        return [{"symbol": self._position_symbol, "contracts": 1.5, "side": self._position_side}]
 
     def create_order(self, symbol, order_type, side, qty, price=None, params=None):
         self.create_order_calls.append({"order_type": order_type, "side": side, "qty": qty, "params": params})
@@ -355,6 +365,79 @@ def test_ensure_stop_placed_keeps_retrying_when_price_not_actually_breached(db_p
     assert result.closed_instead is False
     # market 청산 시도 없이 STOP_MARKET만 max_retries번 재시도했어야 함
     assert [c["order_type"] for c in exchange.create_order_calls] == ["STOP_MARKET", "STOP_MARKET"]
+
+
+# =====================================================================
+# ensure_stop_placed — 2026-08-23 사고 회귀 테스트(AAVE/ADA/BCH/UNI,
+# -2021 폴백이 거래소 재검증 없이 이미 사라진 포지션에 reduceOnly 청산을
+# 반복 시도하다 -2022로 계속 거부당해 약 24시간 CRITICAL을 반복 발신)
+# =====================================================================
+
+class _AlreadyClosedStubExchange(_RaceConditionStubExchange):
+    """-2021은 재현하되(가격 재확인까지는 조건 충족), 거래소엔 이미
+    포지션이 없는 상태(정상 손절 등으로 우리가 알기 전에 선청산됨)를
+    흉내낸다. market(긴급청산) create_order가 실제로 호출되면 실패하도록
+    막아, 재검증 없이 청산을 시도하는 회귀를 확실히 잡는다."""
+
+    def fetch_positions(self):
+        return []
+
+    def create_order(self, symbol, order_type, side, qty, price=None, params=None):
+        if order_type == "market":
+            raise AssertionError("거래소 재검증 없이 긴급청산 주문을 시도함 - 회귀")
+        return super().create_order(symbol, order_type, side, qty, price, params)
+
+
+def test_ensure_stop_placed_skips_emergency_close_when_exchange_already_flat(db_path, monkeypatch):
+    """정상: -2021 + 가격조건 충족이어도, 거래소 실측(fetch_positions)에
+    포지션이 이미 없으면 긴급 reduceOnly 청산을 시도하지 않고 즉시
+    already_closed_on_exchange=True로 반환한다 - DB 정리는 호출부
+    (_handle_stop_result) 책임."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    exchange = _AlreadyClosedStubExchange(current_price=1900.0)
+    position = SimpleNamespace(direction="long", qty=1.5, current_stop=1907.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "ETH/USDT:USDT", position)
+
+    assert result.stop_confirmed is False
+    assert result.closed_instead is False
+    assert result.already_closed_on_exchange is True
+    assert result.close_result is None
+    assert [c["order_type"] for c in exchange.create_order_calls] == ["STOP_MARKET"]
+
+
+def test_ensure_stop_placed_still_closes_when_exchange_position_reversed(db_path, monkeypatch):
+    """경계: fetch_positions()에 심볼이 있어도 방향이 기대와 다르면(이미
+    반전됨) 우리 포지션은 없는 것과 같으므로 역시 청산을 시도하지 않는다."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    exchange = _AlreadyClosedStubExchange(current_price=1900.0)
+    exchange.fetch_positions = lambda: [
+        {"symbol": "ETH/USDT:USDT", "contracts": 1.5, "side": "short"}
+    ]
+    position = SimpleNamespace(direction="long", qty=1.5, current_stop=1907.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "ETH/USDT:USDT", position)
+
+    assert result.already_closed_on_exchange is True
+    assert [c["order_type"] for c in exchange.create_order_calls] == ["STOP_MARKET"]
+
+
+def test_ensure_stop_placed_still_closes_when_exchange_position_confirmed_open(db_path, monkeypatch):
+    """실패(=계속 정상 동작 확인): 거래소에 실제로 같은 방향 포지션이
+    남아있으면 재검증을 통과하고 기존 긴급청산 흐름을 그대로 수행한다 -
+    새 재검증 로직이 정상 케이스를 막지 않는지 확인."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    exchange = _RaceConditionStubExchange(current_price=1900.0)
+    exchange.fetch_positions = lambda: [
+        {"symbol": "ETH/USDT:USDT", "contracts": 1.5, "side": "long"}
+    ]
+    position = SimpleNamespace(direction="long", qty=1.5, current_stop=1907.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "ETH/USDT:USDT", position)
+
+    assert result.closed_instead is True
+    assert result.already_closed_on_exchange is False
+    assert result.close_result.status == "filled"
 
 
 # =====================================================================

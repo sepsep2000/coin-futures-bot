@@ -189,12 +189,12 @@ def test_load_incidents_reads_yaml_registry(tmp_path):
 
 def test_load_incidents_real_registry_file_parses_without_error():
     """실제 reports/incidents.yaml이 형식 오류 없이 파싱되는지 - 등록된
-    5개 사고 전부 필수 필드(id/start/end/pnl_impact)를 갖는지 확인."""
+    6개 사고 전부 필수 필드(id/start/end/pnl_impact)를 갖는지 확인."""
     project_root = Path(__file__).resolve().parent.parent
     data = incident_pnl.load_incidents(project_root / "reports" / "incidents.yaml")
 
     assert data["g4_start"] is not None
-    assert len(data["incidents"]) == 5
+    assert len(data["incidents"]) == 6
     for incident in data["incidents"]:
         assert "id" in incident and "start" in incident and "end" in incident
         assert "pnl_impact" in incident

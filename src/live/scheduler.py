@@ -251,8 +251,23 @@ def _handle_stop_result(db_path: Path, symbol: str, strategy: str, direction: st
     반드시 반영해야 한다 - 안 하면 거래소는 이미 포지션이 없는데 DB엔
     여전히 열려있는 것으로 남아 다음 틱에서 혼란을 일으킨다(이 프로젝트가
     반복적으로 지적해 온 "로컬 상태 vs 거래소 실측 불일치" 패턴 재발
-    방지). stop_confirmed=False인데 closed_instead도 False인 경우는
-    executor.py가 이미 CRITICAL로 로깅했으므로 여기서 추가로 할 일 없음."""
+    방지). stop_confirmed=False인데 closed_instead/already_closed_on_exchange
+    둘 다 False인 경우는 executor.py가 이미 CRITICAL로 로깅했으므로 여기서
+    추가로 할 일 없음.
+
+    ★ 2026-08-23 사고 대응(AAVE/ADA/BCH/UNI, 약 24시간 CRITICAL 반복 발신):
+    already_closed_on_exchange는 -2021 폴백이 거래소를 재확인한 결과
+    포지션이 이미 없었던 경우다(정상 손절 등으로 우리가 알기 전에 이미
+    청산됨) - closed_instead와 달리 방금 우리가 청산 주문을 넣은 게
+    아니므로 CRITICAL이 아니라 일반 알림으로 "stale DB 레코드를
+    정리했다"는 사실만 전달한다(같은 사고의 알림 폭주 재발 방지)."""
+    if stop_result.already_closed_on_exchange:
+        live_state.delete_position(db_path, symbol, strategy)
+        telegram.send_message(
+            f"{symbol}({strategy}) {direction} 포지션: 거래소엔 이미 없었음(정상 손절 등으로 선청산 추정) - "
+            f"청산 주문 없이 stale DB 레코드만 정리함"
+        )
+        return
     if not stop_result.closed_instead:
         return
     live_state.delete_position(db_path, symbol, strategy)

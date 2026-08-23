@@ -171,7 +171,7 @@ def test_tick_ensure_stop_sweep_runs_before_2a_and_filtered_trend(db_path, monke
 
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
                          lambda exchange, db, symbol, position, max_retries=3: calls.append(f"ensure_stop:{symbol}")
-                         or SimpleNamespace(stop_confirmed=True, closed_instead=False))
+                         or SimpleNamespace(stop_confirmed=True, closed_instead=False, already_closed_on_exchange=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 10000.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: True)
     monkeypatch.setattr(scheduler, "_process_2a_rebalance",
@@ -187,7 +187,7 @@ def test_tick_ensure_stop_sweep_runs_before_2a_and_filtered_trend(db_path, monke
 def test_tick_non_rebalance_boundary_skips_2a(db_path, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
-                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False, already_closed_on_exchange=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 10000.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: False)
     monkeypatch.setattr(scheduler, "_process_2a_rebalance",
@@ -206,7 +206,7 @@ def test_tick_daily_loss_limit_breach_blocks_entries_but_still_processes(db_path
     전달돼야 한다(그 함수 내부가 신규진입만 건너뜀)."""
     calls: list[str] = []
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
-                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False, already_closed_on_exchange=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (-500.0, 10000.0))
     monkeypatch.setattr(scheduler, "_handle_daily_loss_limit_breach",
                          lambda db, ex, pnl, eq, ts, pct: calls.append("breach_handled"))
@@ -231,7 +231,8 @@ def test_tick_continues_when_ensure_stop_placed_fails(db_path, monkeypatch):
 
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
                          lambda *a, **k: calls.append("ensure_stop_failed")
-                         or SimpleNamespace(stop_confirmed=False, closed_instead=False))
+                         or SimpleNamespace(stop_confirmed=False, closed_instead=False,
+                                            already_closed_on_exchange=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 10000.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: False)
     monkeypatch.setattr(scheduler, "_process_filtered_trend_tick",
@@ -244,7 +245,7 @@ def test_tick_continues_when_ensure_stop_placed_fails(db_path, monkeypatch):
 
 def test_tick_saves_equity_snapshot(db_path, monkeypatch):
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
-                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False, already_closed_on_exchange=False))
     monkeypatch.setattr(scheduler, "_get_daily_pnl_and_equity", lambda cfg, db, ex, ts: (0.0, 12345.0))
     monkeypatch.setattr(scheduler, "_is_2a_rebalance_tick", lambda ts: False)
     monkeypatch.setattr(scheduler, "_process_filtered_trend_tick", lambda *a, **k: None)
@@ -494,7 +495,7 @@ def test_handle_stop_result_noop_when_stop_confirmed(db_path, monkeypatch):
     monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: sent.append(msg) or True)
 
     scheduler._handle_stop_result(db_path, "ETH/USDT:USDT", "filtered_trend", "long",
-                                   SimpleNamespace(stop_confirmed=True, closed_instead=False))
+                                   SimpleNamespace(stop_confirmed=True, closed_instead=False, already_closed_on_exchange=False))
 
     assert load_open_positions(db_path, strategy="filtered_trend") != []  # 그대로 유지
     assert sent == []
@@ -510,11 +511,33 @@ def test_handle_stop_result_deletes_position_and_alerts_when_closed_instead(db_p
     close_result = SimpleNamespace(status="filled", filled_qty=1.0, avg_fill_price=2895.0)
 
     scheduler._handle_stop_result(db_path, "ETH/USDT:USDT", "filtered_trend", "long",
-                                   SimpleNamespace(stop_confirmed=False, closed_instead=True, close_result=close_result))
+                                   SimpleNamespace(stop_confirmed=False, closed_instead=True,
+                                                    already_closed_on_exchange=False, close_result=close_result))
 
     assert load_open_positions(db_path, strategy="filtered_trend") == []
     assert len(sent) == 1
     assert "즉시청산" in sent[0]
+
+
+def test_handle_stop_result_cleans_db_with_non_critical_alert_when_already_closed_on_exchange(db_path, monkeypatch):
+    """★ 2026-08-23 사고 회귀(AAVE/ADA/BCH/UNI): already_closed_on_exchange=True면
+    (우리가 방금 청산한 게 아니라 이미 거래소에서 사라져 있던 경우) DB
+    레코드만 정리하고, CRITICAL이 아니라 일반 알림으로만 보낸다 - 알림
+    폭주(24시간 CRITICAL 반복) 재발을 막기 위한 핵심 구분."""
+    save_position(db_path, "AAVE/USDT:USDT", "2a", "short", 1.5, 200.0, "t", 210.0)
+    critical_sent = []
+    normal_sent = []
+    monkeypatch.setattr(scheduler.telegram, "send_critical_alert", lambda msg: critical_sent.append(msg) or True)
+    monkeypatch.setattr(scheduler.telegram, "send_message", lambda msg: normal_sent.append(msg) or True)
+
+    scheduler._handle_stop_result(db_path, "AAVE/USDT:USDT", "2a", "short",
+                                   SimpleNamespace(stop_confirmed=False, closed_instead=False,
+                                                    already_closed_on_exchange=True, close_result=None))
+
+    assert load_open_positions(db_path, strategy="2a") == []
+    assert critical_sent == []
+    assert len(normal_sent) == 1
+    assert "이미 없었음" in normal_sent[0]
 
 
 # =====================================================================
@@ -1028,7 +1051,7 @@ def test_process_filtered_trend_tick_logs_attempt_before_placing_order(db_path, 
     monkeypatch.setattr(scheduler.executor, "place_order",
                          lambda *a, **k: SimpleNamespace(status="filled", avg_fill_price=100.0))
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
-                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False))
+                         lambda *a, **k: SimpleNamespace(stop_confirmed=True, closed_instead=False, already_closed_on_exchange=False))
     monkeypatch.setattr(scheduler.telegram, "send_entry_exit_notification", lambda **k: True)
 
     scheduler._process_filtered_trend_tick(FT_CFG, db_path, object(), object(), ts, 10000.0, False)
@@ -1059,6 +1082,7 @@ def test_process_filtered_trend_tick_deletes_position_and_skips_entry_notificati
     close_result = SimpleNamespace(status="filled", filled_qty=1.0, avg_fill_price=89.5)
     monkeypatch.setattr(scheduler.executor, "ensure_stop_placed",
                          lambda *a, **k: SimpleNamespace(stop_confirmed=False, closed_instead=True,
+                                                          already_closed_on_exchange=False,
                                                           close_result=close_result))
     entry_sent = []
     critical_sent = []
