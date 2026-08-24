@@ -1,5 +1,64 @@
 # PROGRESS.md
 
+## 2026-08-23 (이어서) — 다중 프로세스 동시실행 원천 차단(runner.py 싱글턴 락)
+
+**사고**: 위 -2021 폴백 수정을 반영해 봇을 안전 재개하는 과정에서, 재시작
+검증 방법(별도 `wsl bash -lc` 세션에서 `pgrep`으로 생존 확인)이 신뢰할 수
+없었음 - 실제로는 살아있는 프로세스를 "죽었다"고 오판해 `setsid nohup`,
+Claude Code 도구의 `run_in_background` 등 **`scripts/run_cycle.sh`를 거치지
+않는 경로로 runner.py를 직접 여러 번 실행**했다. 그 결과 runner.py 인스턴스
+2개 이상이 실제로 동시에 살아있는 상태가 만들어졌고, 둘 다 같은 ETH 15분봉
+parquet 캐시 파일에 동시 쓰기를 시도해 손상(`FileNotFoundError` →
+`OSError: Couldn't deserialize thrift`)됨 - 손상된 캐시로 여러 프로세스가
+각자 `_tick 실패`를 반복하며 각자의 `consecutive_errors` 카운터를 독립
+증가시켰고, 08/23 12:15:43~45 UTC에 SPEC 2.4 연속오류 킬스위치(5회)가
+발동해 2a 8개 포지션(AAVE/BCH/BNB/NEAR/TRX/XMR/XRP/ZEC) 전부가 시장가
+reduceOnly로 강제청산됨. `fetch_income_since()` + `orders` 테이블 대조 결과
+심볼당 정확히 1건씩 총 8건, 중복 없음, 실현손익 +$0.82/수수료 -$0.56 →
+순영향 약 **+$0.26**(청산 시점이 진입가 근접이라 실질적 금전 피해는 없었음).
+고아 스탑주문 8건은 사용자 확인 후 별도 정리 예정.
+
+**근본원인(사용자 질의 2번 답)**: `scripts/run_cycle.sh`의 PID파일+`kill -0`
+가드는 **그 스크립트를 거칠 때만** 작동한다 - 존재 자체는 정상이었고 이번에
+"안 걸린" 게 아니라, 애초에 그 경로를 타지 않는 실행(수동 직접 실행)이었어서
+가드 대상이 아니었다. 즉 가드의 버그가 아니라 가드의 적용 범위가 "이
+스크립트로 시작한 프로세스"로 한정돼 있었던 설계적 공백 - 실행 경로가
+여러 개(run_cycle.sh, 수동 셸, 자동화 도구의 백그라운드 실행)인 이상 셸
+레벨 가드만으로는 원천 차단이 안 됨.
+
+**수정**: [runner.py](src/live/runner.py)에 `acquire_singleton_lock()` 추가 -
+`fcntl.flock()`(POSIX)/`msvcrt.locking()`(Windows) 기반 OS 레벨 배타
+잠금(`logs/runner.lock`)을 **runner.py의 `main()` 진입점 자체**에 건다 -
+어떤 경로로 실행되든(run_cycle.sh든 수동이든) 항상 이 진입점을 통과하므로
+우회 불가능. OS 잠금은 프로세스가 정상종료/크래시/SIGKILL 무엇으로 죽든
+자동 해제되므로, 기존 PID파일+`kill -0` 방식의 TOCTOU 레이스(파일은 있는데
+그 사이 죽었거나, 아직 파일에 안 쓰였는데 이미 떠 있는 경우)가 구조적으로
+없다. 잠금 실패 시 예외를 던지지 않고 `main()`이 경고 로그만 남기고 조용히
+(exit code 0) 반환 - `run_live_loop`는 절대 호출되지 않는다.
+
+**parquet 캐시 자체 락(사용자 질의 3번)은 별도로 추가하지 않음** - 사용자가
+명시 허용한 대안(1번 싱글턴 락으로 원천 차단)을 택함. 이제 프로세스가 항상
+유일함이 OS 레벨에서 보장되므로 `save_cache()`에 동시쓰기 방어를 별도로
+넣는 건 이미 불가능해진 시나리오에 대한 방어(CLAUDE.md: 가상의 미래 상황에
+대비한 코드 금지)라 추가하지 않음.
+
+**테스트**: [tests/test_runner.py](tests/test_runner.py) 신규 4개(정상: 무잠금
+상태에서 획득 성공, 실패=핵심회귀: 잠금 보유 중 2차 시도 거부, 경계: 해제 후
+재획득 성공, 통합: `main()`이 잠금 실패 시 `run_live_loop` 미호출) - mock 없이
+실제 OS 파일 잠금으로 검증(같은 프로세스 내 서로 다른 파일핸들끼리도
+flock/msvcrt 잠금이 충돌하는 성질 이용). Windows에서 `msvcrt.locking()` 충돌
+직후 `close()`가 별도로 `PermissionError`를 던지는 실측 발견 - `except OSError`
+안에서 close()도 방어적으로 감쌈. `pytest tests/ -x -q` **361/361 통과**(양쪽
+venv).
+
+**손상된 캐시 조치**: `data/ohlcv/ETHUSDT-USDT_15m.parquet`를 삭제 대신
+`data/ohlcv/corrupted_backup/`로 이동(원본 보존, 되돌릴 수 있게) - 다음 정상
+틱에서 30일치 재조회로 자동 재생성됨(2026-07-27 사고 때 검증된 동일 경로).
+
+**미해결**: 고아 스탑주문 8건 취소, 청산된 2a 8개 포지션 재진입 여부는
+사용자 확인 대기 중(자동승인 모드에서 거래소 주문 취소는 차단됨 - 사용자
+직접 판단 필요).
+
 ## 2026-08-23 — ensure_stop_placed() -2021 폴백 거래소 재검증 추가 + 5일 공백 헬스체크 전수조사
 
 **배경(5일 공백 조사, 8/18~8/23)**: 사용자 부재중 발생한 healthcheck FAIL
