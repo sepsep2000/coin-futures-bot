@@ -1,5 +1,21 @@
 # PROGRESS.md
 
+## 2026-09-21 — 저장소 복구/보호: index.lock 제거 + 미푸시 커밋 원격 반영
+
+**변경**: `.git/index.lock`(0바이트, git 프로세스 없음) 제거로 git 쓰기 복구.
+`.claude/settings.local.json`(로컬 권한 허용 목록, 개인 경로 포함)을
+`.gitignore`에 추가. 미푸시였던 `14e3f1e`(싱글턴 락)·`55dcccd`(사고 기록)
+포함 로컬 커밋 전부를 `origin/main`에 push.
+
+**확인 사항**: 작업 시작 시 "미커밋 변경 111개"로 전달받았으나 lock 제거 후
+실측하면 tracked 변경 0건, untracked는 `.claude/` 1건뿐이었음(`git ls-files
+-m` 0건). 111개가 어디로 갔는지는 규명 못 함 - 이미 커밋됐거나 lock에 의한
+stale 상태 출력이었던 것으로 추정.
+
+**테스트**: `pytest tests/ -x -q` 361 passed, 5 deselected(코드 변경 없음).
+
+**미해결**: 없음.
+
 ## 2026-08-23 (이어서) — 다중 프로세스 동시실행 원천 차단(runner.py 싱글턴 락)
 
 **사고**: 위 -2021 폴백 수정을 반영해 봇을 안전 재개하는 과정에서, 재시작
