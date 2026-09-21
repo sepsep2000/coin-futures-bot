@@ -20,3 +20,5 @@ __pycache__/
 .venv-wsl/
 venv/
 *.log
+# Claude Code 로컬 전용 설정 (개인 경로/권한 허용 목록)
+.claude/settings.local.json
