@@ -29,6 +29,7 @@ Binance 실측 income 원장(`fapiPrivateGetIncome`)을 페이지네이션으로
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -324,6 +325,41 @@ def _position_still_open(exchange, symbol: str, expected_direction: str) -> bool
     return real_direction == expected_direction
 
 
+# 가격/수량 일치 허용오차 - 실측(2026-09-22, BTC/LTC/NEAR/SOL/UNI 스탑)
+# 기준 거래소 precision 반올림으로 생기는 차이가 최대 약 0.03%(NEAR)였다 -
+# 이보다 훨씬 큰 차이(예: 재진입으로 진입가/스탑이 바뀐 경우)만 "다른 스탑"
+# 으로 판정하도록 여유를 두되, 완전히 다른 자산 배치를 같다고 오판하지 않을
+# 만큼은 타이트하게(0.1%) 잡는다.
+_STOP_MATCH_REL_TOL = 1e-3
+
+
+def _stop_matches_position(order: dict, position, stop_price: float) -> bool:
+    """거래소에 이미 걸린 STOP_MARKET 주문이 '이 포지션'을 보호하는 그
+    주문이 맞는지 가격·수량까지 확인한다.
+
+    ★ 실측으로 발견한 버그 수정(2026-09-22, TRX/ZEC): 기존 로직은 type/
+    side/algoStatus만 보고 "존재하면 확인됨"으로 판정했다 - 8/23 킬스위치
+    사고로 TRX/ZEC 포지션이 강제청산된 뒤 8/28에 옛 가격 기준 스탑이
+    재생성됐는데, 9/6 리밸런스가 같은 심볼로 **다른 진입가**로 재진입하면서
+    ensure_stop_placed()가 "이미 스탑 있음"으로 오판해 새 스탑을 걸지
+    않았다. 결과: 거래소에 걸린 스탑이 현재 포지션의 진입가/수량과 무관한
+    옛 값(ZEC 트리거 563.74 vs 의도 718.28, 22% 괴리 / TRX 수량 564 vs
+    의도 582)으로 방치됨 - 실사고 없이 실측 재검증에서만 발견(테스트넷).
+    이제 가격·수량이 이 포지션과 실제로 일치하는 주문만 "확인됨"으로 본다."""
+    order_qty = order.get("quantity")
+    order_price = order.get("triggerPrice")
+    if order_qty is None or order_price is None:
+        return False
+    try:
+        order_qty = float(order_qty)
+        order_price = float(order_price)
+    except (TypeError, ValueError):
+        return False
+    qty_ok = math.isclose(order_qty, float(position.qty), rel_tol=_STOP_MATCH_REL_TOL, abs_tol=1e-9)
+    price_ok = math.isclose(order_price, stop_price, rel_tol=_STOP_MATCH_REL_TOL, abs_tol=1e-9)
+    return qty_ok and price_ok
+
+
 def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
                         max_retries: int = STOP_CHECK_MAX_RETRIES) -> StopPlacementResult:
     """포지션 존재 + 스탑 부재 = 최우선 복구 대상(CLAUDE.md). 매 시도마다
@@ -351,7 +387,14 @@ def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
     확인된 패턴. 이 예외를 잡으면 현재가를 재조회해 정말 조건이 충족됐는지
     확인하고, 충족됐으면 대기하는 스탑 대신 reduceOnly 시장가로 즉시
     청산한다(스탑의 목적 자체가 "이 가격을 넘으면 즉시 나간다"이므로 이미
-    넘었으면 지금 나가는 게 취지와 정확히 같다 - 새 리스크 정책이 아님)."""
+    넘었으면 지금 나가는 게 취지와 정확히 같다 - 새 리스크 정책이 아님).
+
+    ★ 실측으로 발견한 버그 수정(2026-09-22): "스탑이 존재하는지" 확인이
+    type/side/status만 봐서, 다른 진입가/수량으로 재진입한 뒤에도 옛
+    포지션 때 걸린 스탑을 "이미 확인됨"으로 오판하는 사례가 실측 발견됨
+    (_stop_matches_position() 참조). 이제 가격·수량까지 일치하는 스탑만
+    확인된 것으로 보고, side는 같지만 가격/수량이 다른(=옛 포지션의 유물)
+    스탑은 취소 후 현재 포지션 기준으로 재배치한다."""
     stop_side = "sell" if position.direction == "long" else "buy"
     stop_price = float(position.current_stop)  # 근본원인 A: native float 명시 캐스팅
     last_error: Optional[str] = None
@@ -361,14 +404,28 @@ def ensure_stop_placed(exchange, db_path: Path, symbol: str, position,
             exchange.load_markets()
             raw_symbol = exchange.market(symbol)["id"]
             open_stops = _fetch_open_stop_orders(exchange, raw_symbol)
-            stop_exists = any(
-                o.get("orderType") == "STOP_MARKET"
+            same_side_stops = [
+                o for o in open_stops
+                if o.get("orderType") == "STOP_MARKET"
                 and str(o.get("side", "")).upper() == stop_side.upper()
                 and str(o.get("algoStatus", "")).upper() == "NEW"
-                for o in open_stops
-            )
-            if stop_exists:
+            ]
+            if any(_stop_matches_position(o, position, stop_price) for o in same_side_stops):
                 return StopPlacementResult(stop_confirmed=True)
+
+            for stale in same_side_stops:
+                try:
+                    exchange.fapiPrivateDeleteAlgoOrder({"algoId": stale["algoId"]})
+                    _log_stderr(
+                        f"ensure_stop_placed: {symbol} 옛 스탑(algoId={stale.get('algoId')}, "
+                        f"qty={stale.get('quantity')}, price={stale.get('triggerPrice')})이 현재 "
+                        f"포지션(qty={position.qty}, stop={stop_price})과 달라 취소 후 재배치"
+                    )
+                except Exception as exc:  # noqa: BLE001 - 취소 실패해도 새 배치는 계속 시도
+                    _log_stderr(
+                        f"ensure_stop_placed: {symbol} 옛 스탑 취소 실패(algoId={stale.get('algoId')}): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
 
             exchange.create_order(
                 symbol, "STOP_MARKET", stop_side, position.qty,

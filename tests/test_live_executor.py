@@ -181,11 +181,14 @@ class _StopStubExchange:
     흉내낸다. create_order 성공 시 다음 조회부터 그 스탑이 보이도록
     상태를 흉내낸다(실거래소의 비동기 반영과 유사)."""
 
-    def __init__(self, initial_stops=None, create_fails=False, market_id="BTCUSDT"):
+    def __init__(self, initial_stops=None, create_fails=False, market_id="BTCUSDT",
+                 delete_fails=False):
         self._algo_orders = list(initial_stops or [])
         self._create_fails = create_fails
+        self._delete_fails = delete_fails
         self._market_id = market_id
         self.create_order_calls = 0
+        self.deleted_algo_ids: list = []
 
     def load_markets(self):
         pass
@@ -196,6 +199,13 @@ class _StopStubExchange:
     def fapiPrivateGetOpenAlgoOrders(self):
         return list(self._algo_orders)
 
+    def fapiPrivateDeleteAlgoOrder(self, params):
+        if self._delete_fails:
+            raise RuntimeError("simulated cancel error")
+        algo_id = params["algoId"]
+        self.deleted_algo_ids.append(algo_id)
+        self._algo_orders = [o for o in self._algo_orders if o.get("algoId") != algo_id]
+
     def create_order(self, symbol, order_type, side, qty, params=None):
         self.create_order_calls += 1
         self.last_params = params
@@ -204,6 +214,7 @@ class _StopStubExchange:
         self._algo_orders.append({
             "symbol": self._market_id, "orderType": "STOP_MARKET",
             "side": side.upper(), "algoStatus": "NEW", "algoId": f"ALGO{self.create_order_calls}",
+            "quantity": qty, "triggerPrice": (params or {}).get("stopPrice"),
         })
         return {"id": f"ALGO{self.create_order_calls}"}
 
@@ -211,7 +222,10 @@ class _StopStubExchange:
 def test_ensure_stop_placed_detects_existing_stop_without_duplicate(db_path):
     """실측으로 발견했던 버그(fetch_open_orders는 STOP_MARKET을 못 봄)의
     회귀 테스트 — 이미 스탑이 있으면 create_order를 호출하지 않아야 한다."""
-    existing = [{"symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW"}]
+    existing = [{
+        "symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW",
+        "quantity": "0.002", "triggerPrice": "60000.0",
+    }]
     exchange = _StopStubExchange(initial_stops=existing)
     position = SimpleNamespace(direction="long", qty=0.002, current_stop=60000.0)
 
@@ -220,6 +234,88 @@ def test_ensure_stop_placed_detects_existing_stop_without_duplicate(db_path):
     assert result.stop_confirmed is True
     assert result.closed_instead is False
     assert exchange.create_order_calls == 0
+    assert exchange.deleted_algo_ids == []
+
+
+# =====================================================================
+# ensure_stop_placed — 2026-09-22 회귀 테스트(TRX/ZEC 실측 발견: 옛
+# 포지션 때 걸린 스탑을 가격/수량 확인 없이 "존재함"으로 오판)
+# =====================================================================
+
+def test_ensure_stop_placed_replaces_stale_stop_with_different_price(db_path, monkeypatch):
+    """정상: 같은 방향(side)의 스탑이 걸려있어도 가격이 현재 포지션의
+    스탑과 실제로 다르면(=옛 포지션의 유물) "확인됨"으로 오판하지 않고
+    취소 후 현재 포지션 기준으로 재배치한다."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    stale = [{
+        "symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW",
+        "algoId": "OLD1", "quantity": "0.002", "triggerPrice": "50000.0",
+    }]
+    exchange = _StopStubExchange(initial_stops=stale)
+    position = SimpleNamespace(direction="long", qty=0.002, current_stop=60000.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
+
+    assert result.stop_confirmed is True
+    assert exchange.deleted_algo_ids == ["OLD1"]
+    assert exchange.create_order_calls == 1
+    assert exchange.last_params["stopPrice"] == 60000.0
+
+
+def test_ensure_stop_placed_replaces_stale_stop_with_different_quantity(db_path, monkeypatch):
+    """정상(TRX/ZEC 실측 재현): 가격은 비슷해도 수량이 현재 포지션과 크게
+    다르면(예: 재진입으로 사이즈가 바뀜) 역시 취소 후 재배치한다."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    stale = [{
+        "symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW",
+        "algoId": "OLD1", "quantity": "0.003", "triggerPrice": "60000.0",
+    }]
+    exchange = _StopStubExchange(initial_stops=stale)
+    position = SimpleNamespace(direction="long", qty=0.002, current_stop=60000.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
+
+    assert result.stop_confirmed is True
+    assert exchange.deleted_algo_ids == ["OLD1"]
+    assert exchange.create_order_calls == 1
+
+
+def test_ensure_stop_placed_tolerates_exchange_rounding(db_path):
+    """경계: 거래소 precision 반올림으로 생기는 아주 작은 차이(실측 NEAR
+    사례, 약 0.03%)는 "다른 스탑"으로 오판하지 않는다 - 매번 불필요하게
+    취소/재배치를 반복하면 안 된다."""
+    existing = [{
+        "symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW",
+        "algoId": "OK1", "quantity": "0.002", "triggerPrice": "1.5334599",
+    }]
+    exchange = _StopStubExchange(initial_stops=existing)
+    position = SimpleNamespace(direction="long", qty=0.002, current_stop=1.533)  # 거래소 반올림값
+
+    result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
+
+    assert result.stop_confirmed is True
+    assert exchange.create_order_calls == 0
+    assert exchange.deleted_algo_ids == []
+
+
+def test_ensure_stop_placed_replace_survives_cancel_failure(db_path, monkeypatch, capsys):
+    """실패: 옛 스탑 취소 자체가 실패해도(거래소 일시 오류 등) 조용히
+    포기하지 않고 로그를 남긴 뒤 새 스탑 배치는 계속 시도한다(CLAUDE.md
+    "예외를 조용히 삼키지 않는다" 원칙)."""
+    monkeypatch.setattr(executor.time, "sleep", lambda s: None)
+    stale = [{
+        "symbol": "BTCUSDT", "orderType": "STOP_MARKET", "side": "SELL", "algoStatus": "NEW",
+        "algoId": "OLD1", "quantity": "0.002", "triggerPrice": "50000.0",
+    }]
+    exchange = _StopStubExchange(initial_stops=stale, delete_fails=True)
+    position = SimpleNamespace(direction="long", qty=0.002, current_stop=60000.0)
+
+    result = executor.ensure_stop_placed(exchange, db_path, "BTC/USDT:USDT", position)
+
+    assert result.stop_confirmed is True
+    assert exchange.create_order_calls == 1
+    captured = capsys.readouterr()
+    assert "옛 스탑 취소 실패" in captured.err
 
 
 def test_ensure_stop_placed_creates_when_missing_then_confirms(db_path, monkeypatch):
